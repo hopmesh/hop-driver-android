@@ -9,10 +9,10 @@ import android.content.Context
 import sh.hop.HopNode
 import sh.hop.HopRuntime
 import sh.hop.randomNodeId
-import net.waldrip.hop.bearers.ble.BleBearer
-import net.waldrip.hop.bearers.lan.LanBearer
-import net.waldrip.hop.bearers.relay.RelayBearer
-import net.waldrip.hop.bearers.wifidirect.WifiDirectBearer
+import sh.hopme.bearers.ble.BleBearer
+import sh.hopme.bearers.lan.LanBearer
+import sh.hopme.bearers.relay.RelayBearer
+import sh.hopme.bearers.wifidirect.WifiDirectBearer
 import java.util.Timer
 import kotlin.concurrent.timerTask
 
