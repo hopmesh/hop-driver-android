@@ -350,9 +350,10 @@ class HopBearer private constructor(private val context: Context, private val co
     }
 
     /// Release every long-lived resource this driver owns: the shared bearers (radios/sockets), the DoH
-    /// HTTP client, the serial core HandlerThread, and the libhop node handle. Without this, an
-    /// enable/disable cycle (or a service teardown) leaked the "hop.core" thread, the BearerManager's
-    /// radios + the RelayBearer's socket/executor, the OkHttp DoH dispatcher pool, and the native node.
+    /// HTTP client, the serial core HandlerThread, and the libhop node handle. This is the cleanup path
+    /// for a process-level teardown (e.g. an owning foreground service's onDestroy); the current demo
+    /// creates the singleton from an Activity and relies on process death, so it is not yet wired to a
+    /// lifecycle callback, but it is kept correct and crash-safe so wiring it is a one-liner.
     /// Idempotent + safe to call from any thread; the actual node close runs on core (its only caller)
     /// AFTER the tick loop and pending work drain, so nothing touches a freed handle. Mirrors the
     /// executor/link cleanup the RelayBearer got.
@@ -360,6 +361,10 @@ class HopBearer private constructor(private val context: Context, private val co
         if (torndown) return
         torndown = true
         started = false
+        // Drop the process singleton NOW (synchronously), so a concurrent shared() after teardown
+        // builds a FRESH driver instead of handing back this torn-down one (which would be a permanent
+        // brick: torndown is one-way). The old instance is GC'd once its core thread quits below.
+        inst = null
         // Stop the radios/sockets first so no new link event races the node close.
         runCatching { bearerMgr.stop() }
         // Release the DoH client's dispatcher thread pool + connection pool (bounded, but still held).
