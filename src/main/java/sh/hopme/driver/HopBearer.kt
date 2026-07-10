@@ -161,6 +161,11 @@ class HopBearer private constructor(private val context: Context, private val co
     // Link ids currently owned by the BearerManager, so refresh() can tag them by transport. CORE-CONFINED:
     // added/removed and read ONLY inside core.post (pump() also runs on core), so it needs no lock.
     private val bearerLinks = HashSet<Long>()
+    // quality-net-07: per-link tx/rx byte + packet counters. The tick loop emits one LINKFLOW line per
+    // link so the soak's flood-health critic has real per-link throughput to judge (a gossip-flood
+    // regression shows as data-pkt/tx climbing fast on an idle link). CORE-CONFINED like bearerLinks
+    // (onTx runs in pump(); onRx/up/down hop to core via bearerSink), so it needs no lock.
+    private val linkFlow = LinkFlow()
     // Adapts the shared BearerManager to the node seam. Every link from a bearer surfaces here and
     // drives node.connected/received/disconnected (linkId mismatch: the bearer libs use Long, the node
     // uses ULong — convert at this boundary).
@@ -193,12 +198,13 @@ class HopBearer private constructor(private val context: Context, private val co
             }
             core.post {
                 bearerLinks.add(link)
+                linkFlow.linkUp(link, t)   // quality-net-07: start per-link tx/rx counters
                 node.connected(link.toULong(), role == sh.hop.HopRole.DIALER)
                 pump()   // ship the dialer's queued Noise m1 immediately (mirrors legacy addLink / Apple linkUp)
             }
         }
         override fun linkBytes(link: Long, bytes: ByteArray) {
-            core.post { node.received(link.toULong(), bytes); pump() }
+            core.post { linkFlow.onRx(link, bytes.size); node.received(link.toULong(), bytes); pump() }
         }
         override fun linkDown(link: Long) {
             // android-11: the manager already dropped the transport mapping, so recognize the relay link
@@ -208,6 +214,7 @@ class HopBearer private constructor(private val context: Context, private val co
             if (wasRelay && relaysOnVal) onUi { relayStatus.value = "reconnecting…" }
             core.post {
                 bearerLinks.remove(link)
+                linkFlow.linkDown(link)   // quality-net-07: stop per-link tx/rx counters
                 node.disconnected(link.toULong())
                 scheduleRefresh()   // mirrors legacy onClose / Apple linkDown
             }
@@ -310,6 +317,11 @@ class HopBearer private constructor(private val context: Context, private val co
                     "NODESTATE upLinks=${pls.size} peers=$distinctPeers pend=${runCatching { node.pendingCount() }.getOrDefault(0u)} " +
                     pls.joinToString(" ") { p -> "id${p.link}=${p.address.take(3).joinToString(""){ b -> "%02x".format(b) }}" +
                         "[sec=${runCatching { node.isSecured(p.address) }.getOrDefault(false)},rt=${runCatching { node.knowsRoute(p.address) }.getOrDefault(false)}]" })
+                // quality-net-07: one LINKFLOW line per bearer link every ~5s. The flood-health critic
+                // reads these tx/rx byte + txpkts[hs/data/frag] counters across rounds to spot a link
+                // whose data/tx climbs fast on idle (the historical gossip-flood regression) vs a healthy
+                // link that grows slowly. Empty (no lines) when there are no bearer links.
+                if (ticks % 5 == 0) for (l in linkFlow.lines()) android.util.Log.i("HOPLOG", l)
                 core.postDelayed(this, 1000)
             }
         }, 1000)
@@ -458,6 +470,7 @@ class HopBearer private constructor(private val context: Context, private val co
         for (pkt in node.drainOutgoing()) {
             // The shared BearerManager (BLE + LAN + Wi-Fi Direct + Relay) owns every link now, so
             // route each outgoing packet to it by link id.
+            linkFlow.onTx(pkt.link.toLong(), pkt.bytes.size)   // quality-net-07: per-link tx counters
             bearerMgr.send(pkt.bytes, pkt.link.toLong())
         }
         scheduleRefresh()
@@ -478,6 +491,10 @@ class HopBearer private constructor(private val context: Context, private val co
                 incoming = true, contentType = m.contentType,
                 imageData = if (isImage) m.body else null, images = images,
                 hops = m.hops, latencyMs = latency, trace = m.trace.map { traceLabel(it) })
+            // quality-net-06: log inbound receipt to logcat the instant it lands, keyed by text (the
+            // harness marker). tk_verify reads this instead of the lagging files/messages.json export.
+            if (!isImage) android.util.Log.i("HOPLOG",
+                "HOPAUTO received from=${addressBase58(m.from)} hops=${m.hops} text=$text")
             queueIdentify(m.from)   // learn the sender's display name (§29)
             // Someone who messages us joins the address book, so their conversation is reachable.
             val k = m.from.toList()
@@ -949,27 +966,25 @@ class HopBearer private constructor(private val context: Context, private val co
         val now = System.currentTimeMillis()
         if (!force && now - lastContactSaveMs < 4000) return   // throttle (refresh runs often)
         lastContactSaveMs = now
-        val arr = org.json.JSONArray()
-        for (p in contacts.values) {
-            arr.put(org.json.JSONObject()
-                .put("addr", addressBase58(p.address)).put("name", p.name)
-                .put("platform", p.platform).put("app", p.app))
+        // quality-net-03: serialize through the pure ContactBook codec (unit-tested round-trip). The
+        // base58 conversion is core-owned (uniffi), so it happens here; the JSON shape is ContactBook's.
+        val records = contacts.values.map {
+            ContactRecord(addressBase58(it.address), it.name, it.platform, it.app)
         }
-        val json = arr.toString()
+        val json = ContactBook.encode(records)
         thread(name = "save-contacts") { runCatching { contactsFile.writeText(json) } }  // off the main thread
     }
     private fun loadContacts() {
         val txt = runCatching { contactsFile.readText() }.getOrNull() ?: return
-        val arr = runCatching { org.json.JSONArray(txt) }.getOrNull() ?: return
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val addr = runCatching { addressFromBase58(o.getString("addr")) }.getOrNull() ?: continue
+        // quality-net-03: parse through the pure ContactBook codec (unit-tested); the driver then does
+        // the core-owned base58 -> bytes conversion + 32-byte validation.
+        for (rec in ContactBook.decode(txt)) {
+            val addr = runCatching { addressFromBase58(rec.addr58) }.getOrNull() ?: continue
             if (addr.size != 32) continue
             val key = addr.toList()
             if (contacts.containsKey(key)) continue
-            val name = o.optString("name", shortHex(addr))
-            contacts[key] = Peer(addr, name, 0u, active = false,
-                platform = o.optString("platform", ""), app = o.optString("app", ""))
+            val name = rec.name.ifEmpty { shortHex(addr) }
+            contacts[key] = Peer(addr, name, 0u, active = false, platform = rec.platform, app = rec.app)
             nameByAddr[key] = name
         }
     }
@@ -1171,6 +1186,12 @@ class HopBearer private constructor(private val context: Context, private val co
             if (m.incoming || m.bundleId == null) continue
             val s = node.messageStatus(m.bundleId)
             if (s.delivered && m.deliveredAt == null) {
+                // quality-net-06: emit the end-to-end delivery ACK to logcat the INSTANT the node reports
+                // it, keyed by the message text (the harness marker). The test harness reads this
+                // logcat line instead of files/messages.json, whose debounced export lags in-memory
+                // delivery by >90s, causing false "delivered=false" records past the poll window.
+                android.util.Log.i("HOPLOG",
+                    "HOPAUTO delivered to=${m.peer} deliveryMs=${s.deliveryMs} hops=${s.deliveryHops} text=${m.text}")
                 msgUpdates.add(m.localId to m.copy(relayed = s.relayed, delivered = true,
                     deliveryHops = s.deliveryHops, deliveryMs = s.deliveryMs.toULong(), deliveredAt = now))
             } else if (s.relayed != m.relayed) {
