@@ -27,14 +27,46 @@ data class HopConfig(
     val dbKey: ByteArray = ByteArray(0),
 ) {
     companion object {
+        /// android-r2-02: the ONE persisted pref both init paths read for the relay flag, so a
+        /// user-launched activity and an OS-driven START_STICKY service restart agree on whether relays
+        /// run. Lives in the "hop" prefs (the same file [HopBearer] reads the runtime killswitch from).
+        const val RELAYS_ENABLED_PREF = "relaysEnabled"
+
+        /// android-r2-02: the single source of truth for the relay flag. Both [MainActivity] and
+        /// [default] resolve it here instead of hardcoding conflicting literals (the activity had `true`,
+        /// [default] had `false`), which made relay behavior depend on WHICH path minted the configure-
+        /// once singleton first. Defaults to [fallback] (false = deployed-off fleet) until the app
+        /// persists an explicit choice via [persistRelaysEnabled].
+        fun relaysEnabled(context: Context, fallback: Boolean = false): Boolean {
+            val prefs = context.getSharedPreferences("hop", Context.MODE_PRIVATE)
+            val stored = if (prefs.contains(RELAYS_ENABLED_PREF)) prefs.getBoolean(RELAYS_ENABLED_PREF, fallback) else null
+            return resolveRelaysEnabled(stored, fallback)
+        }
+
+        /// Pure resolution rule for the relay flag (android-r2-02), split out so the "both init paths
+        /// agree" invariant is unit-testable without a Context: use the persisted choice when present,
+        /// else the fallback. Because BOTH paths feed the SAME persisted value in, they agree by
+        /// construction — the historical bug was two different hardcoded literals, not this rule.
+        fun resolveRelaysEnabled(stored: Boolean?, fallback: Boolean): Boolean = stored ?: fallback
+
+        /// android-r2-02: persist the app's relay choice so BOTH init paths pick it up. Call this before
+        /// building the config so the sticky-service restart sees the same value the activity chose.
+        fun persistRelaysEnabled(context: Context, enabled: Boolean) {
+            context.getSharedPreferences("hop", Context.MODE_PRIVATE)
+                .edit().putBoolean(RELAYS_ENABLED_PREF, enabled).apply()
+        }
+
         /// Build a config from the values the demo app previously hard-coded: the device-derived
         /// identity seed (§4), the shared dev app secret, the user-assigned device name (falling
         /// back to the marketing model), and on-device storage for chat history.
+        /// android-r2-02: relaysEnabled comes from the shared pref (single source of truth), so a
+        /// bare-service restart agrees with the activity instead of defaulting to a different literal.
         fun default(context: Context): HopConfig = HopConfig(
             dbPath = java.io.File(context.filesDir, "hop.db").absolutePath,
             identitySecret = HopBearer.deviceSeed(context),
             appSecret = HopBearer.APP_SECRET,
             deviceName = deviceName(context),
+            relaysEnabled = relaysEnabled(context),
             dbKey = HopBearer.dbKey(context),
         )
 

@@ -130,6 +130,10 @@ class HopBearer private constructor(private val context: Context, private val co
     /// specific relay, rather than publishing presence to several at once.
     val pinnedRelay = mutableStateOf<String?>(null)
     private val nextMsgId = java.util.concurrent.atomic.AtomicLong(0L)
+    /// android-r2-06: monotonic notification id so two messages with identical text (same or different
+    /// sender) don't collide on text.hashCode() and silently replace each other. Starts high to avoid
+    /// colliding with the foreground-service's fixed ONGOING_ID (1).
+    private val nextNotifId = java.util.concurrent.atomic.AtomicInteger(1000)
     @Volatile private var appActive = true
     private val appName: String =
         context.applicationInfo.loadLabel(context.packageManager).toString()
@@ -235,7 +239,10 @@ class HopBearer private constructor(private val context: Context, private val co
         myNameVal = name; onUi { myName.value = name }
         val addr58 = addressBase58(node.address())
         myAddressVal = addr58; onUi { myAddress.value = addr58 }
-        android.util.Log.i("HOPLOG", "HOPAUTO self=$addr58 name=${config.deviceName}")   // test harness reads this for targeting
+        // android-r2-05: the self-address targeting line prints our full base58 address; the harness
+        // needs it, but a release build must not leak identity to logcat. Debug builds only.
+        if (DriverFlags.verboseContentLogs)
+            android.util.Log.i("HOPLOG", "HOPAUTO self=$addr58 name=${config.deviceName}")   // test harness reads this for targeting
         // Presence is an app-level service (DESIGN.md §23): publish our name on the
         // "presence" topic and subscribe so discovered records are retained.
         runCatching { node.subscribe(PRESENCE_SERVICE) }
@@ -305,7 +312,7 @@ class HopBearer private constructor(private val context: Context, private val co
                 // Re-publish our prekey periodically so a neighbour whose cached copy lapsed
                 // (or who arrived later) can always open a forward-secret session to us (§25).
                 if (ticks % 120 == 0) runCatching { node.publishPrekey() }
-                if (ticks % 15 == 0) android.util.Log.i("HOPLOG", "HOPAUTO self=$myAddressVal name=${config.deviceName}")  // periodic, so the harness always finds it
+                if (ticks % 15 == 0 && DriverFlags.verboseContentLogs) android.util.Log.i("HOPLOG", "HOPAUTO self=$myAddressVal name=${config.deviceName}")  // periodic, so the harness always finds it (android-r2-05: debug only)
                 expireHopsWeb()   // android-13: fail out WebView fetches whose resolve/response never arrived
                 pump()
                 // DIAG: node link state each tick. peerLinks() maps each Up link to its peer address,
@@ -370,8 +377,13 @@ class HopBearer private constructor(private val context: Context, private val co
     fun keyFor(p: Peer): String = addressBase58(p.address)
 
     /** Test/automation hook: send [text] to a base58 ADDRESS, building a minimal Peer (no UI selection
-     *  needed). Backs the hopdemo://send deep link so a harness can drive sends without UI taps. */
+     *  needed). Backs the hopdemo://send deep link so a harness can drive sends without UI taps.
+     *
+     *  android-r2-03: this is a silent send-as-user primitive, so it is inert unless the automation
+     *  surface is enabled (debug builds only) — defense in depth beside the debug-only manifest filter
+     *  and the BuildConfig.DEBUG guard in the activity. */
     fun sendTo(addrBase58: String, text: String) {
+        if (!DriverFlags.automationSurface) return   // release: refuse driven sends (android-r2-03)
         val addr = runCatching { addressFromBase58(addrBase58.trim()) }.getOrNull() ?: return
         send(text, Peer(addr, contacts[addr.toList()]?.name ?: "", 0u, active = false))
     }
@@ -493,7 +505,9 @@ class HopBearer private constructor(private val context: Context, private val co
                 hops = m.hops, latencyMs = latency, trace = m.trace.map { traceLabel(it) })
             // quality-net-06: log inbound receipt to logcat the instant it lands, keyed by text (the
             // harness marker). tk_verify reads this instead of the lagging files/messages.json export.
-            if (!isImage) android.util.Log.i("HOPLOG",
+            // android-r2-05: this prints the sender's full address + cleartext body, so it is DEBUG only
+            // (a release build must not leak addresses/message text to logcat).
+            if (!isImage && DriverFlags.verboseContentLogs) android.util.Log.i("HOPLOG",
                 "HOPAUTO received from=${addressBase58(m.from)} hops=${m.hops} text=$text")
             queueIdentify(m.from)   // learn the sender's display name (§29)
             // Someone who messages us joins the address book, so their conversation is reachable.
@@ -709,10 +723,12 @@ class HopBearer private constructor(private val context: Context, private val co
             }
             root.put(id, arr)
         }
-        runCatching { channelsFile.writeText(root.toString()) }
+        // android-r2-01: seal the channel mirror with the Keystore-wrapped db key so it is not
+        // plaintext beside the encrypted hop.db (empty key ⇒ plain, matching an unencrypted db).
+        runCatching { channelsFile.writeBytes(MirrorCrypto.seal(config.dbKey, root.toString().toByteArray())) }
     }
     private fun loadHpsChannels() {
-        val txt = runCatching { channelsFile.readText() }.getOrNull() ?: return
+        val txt = readMirror(channelsFile) ?: return
         val root = runCatching { org.json.JSONObject(txt) }.getOrNull() ?: return
         val loaded = LinkedHashMap<String, List<HpsMsg>>()
         for (id in root.keys()) {
@@ -929,13 +945,24 @@ class HopBearer private constructor(private val context: Context, private val co
         val name = mediaName(bytes)
         if (writtenMedia.add(name)) {
             val f = java.io.File(mediaDir, name)
-            if (!f.exists()) runCatching { f.writeBytes(bytes) }
+            // android-r2-01: seal the photo blob with the db key so media/* is not plaintext at rest.
+            if (!f.exists()) runCatching { f.writeBytes(MirrorCrypto.seal(config.dbKey, bytes)) }
         }
         return name
     }
 
     private fun getMedia(name: String): ByteArray? =
         runCatching { java.io.File(mediaDir, name).readBytes() }.getOrNull()
+            ?.let { blob -> MirrorCrypto.open(config.dbKey, blob) ?: blob }   // sealed, or legacy plaintext
+
+    /// android-r2-01: read a sealed mirror file back to its plaintext JSON string. Opens the sealed
+    /// (AES-GCM, Keystore-wrapped-key) form; if the bytes are a LEGACY plaintext mirror from before
+    /// at-rest encryption (or a plain-SQLite dev build with an empty key), returns them as text so the
+    /// old file is read once and rewritten sealed. Returns null if the file is absent/unreadable.
+    private fun readMirror(f: java.io.File): String? {
+        val blob = runCatching { f.readBytes() }.getOrNull() ?: return null
+        return MirrorCrypto.open(config.dbKey, blob)?.let { String(it) } ?: String(blob)
+    }
 
     private fun mediaName(bytes: ByteArray): String {
         val h = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
@@ -972,10 +999,13 @@ class HopBearer private constructor(private val context: Context, private val co
             ContactRecord(addressBase58(it.address), it.name, it.platform, it.app)
         }
         val json = ContactBook.encode(records)
-        thread(name = "save-contacts") { runCatching { contactsFile.writeText(json) } }  // off the main thread
+        val key = config.dbKey
+        // android-r2-01: seal the address book with the db key so contacts.json (addresses + names) is
+        // not plaintext beside the encrypted hop.db. Off the main thread (refresh runs often).
+        thread(name = "save-contacts") { runCatching { contactsFile.writeBytes(MirrorCrypto.seal(key, json.toByteArray())) } }
     }
     private fun loadContacts() {
-        val txt = runCatching { contactsFile.readText() }.getOrNull() ?: return
+        val txt = readMirror(contactsFile) ?: return
         // quality-net-03: parse through the pure ContactBook codec (unit-tested); the driver then does
         // the core-owned base58 -> bytes conversion + 32-byte validation.
         for (rec in ContactBook.decode(txt)) {
@@ -1011,6 +1041,7 @@ class HopBearer private constructor(private val context: Context, private val co
             val multi = if (m.images.isNotEmpty()) m.images.map { putMedia(it) } else emptyList()
             if (single != null || multi.isNotEmpty()) imgRefs[m.localId] = single to multi
         }
+        val key = config.dbKey
         thread(name = "save-messages") {
             val arr = org.json.JSONArray()
             for (m in snapshot) {
@@ -1034,12 +1065,14 @@ class HopBearer private constructor(private val context: Context, private val co
                 m.bundleId?.let { o.put("bundleId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
                 arr.put(o)
             }
-            runCatching { messagesFile.writeText(arr.toString()) }
+            // android-r2-01: seal the chat mirror with the db key so messages.json (every body) is not
+            // plaintext beside the encrypted hop.db (empty key ⇒ plain, matching an unencrypted db).
+            runCatching { messagesFile.writeBytes(MirrorCrypto.seal(key, arr.toString().toByteArray())) }
         }
     }
 
     private fun loadMessages() {
-        val txt = runCatching { messagesFile.readText() }.getOrNull() ?: return
+        val txt = readMirror(messagesFile) ?: return
         val arr = runCatching { org.json.JSONArray(txt) }.getOrNull() ?: return
         val loaded = ArrayList<Message>()
         for (i in 0 until arr.length()) {
@@ -1100,7 +1133,9 @@ class HopBearer private constructor(private val context: Context, private val co
             .setNumber(unread.intValue)   // drives the launcher icon badge count
             .setBadgeIconType(NotificationCompat.BADGE_ICON_SMALL)
             .build()
-        NotificationManagerCompat.from(context).notify(text.hashCode(), n)
+        // android-r2-06: unique per-notification id (was text.hashCode(), which collided across
+        // messages with identical text, silently replacing an earlier distinct notification).
+        NotificationManagerCompat.from(context).notify(nextNotifId.getAndIncrement(), n)
     }
 
     @Volatile private var refreshScheduled = false
@@ -1190,7 +1225,7 @@ class HopBearer private constructor(private val context: Context, private val co
                 // it, keyed by the message text (the harness marker). The test harness reads this
                 // logcat line instead of files/messages.json, whose debounced export lags in-memory
                 // delivery by >90s, causing false "delivered=false" records past the poll window.
-                android.util.Log.i("HOPLOG",
+                if (DriverFlags.verboseContentLogs) android.util.Log.i("HOPLOG",   // android-r2-05: debug only (leaks peer + text)
                     "HOPAUTO delivered to=${m.peer} deliveryMs=${s.deliveryMs} hops=${s.deliveryHops} text=${m.text}")
                 msgUpdates.add(m.localId to m.copy(relayed = s.relayed, delivered = true,
                     deliveryHops = s.deliveryHops, deliveryMs = s.deliveryMs.toULong(), deliveredAt = now))

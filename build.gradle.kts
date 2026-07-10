@@ -11,6 +11,12 @@ android {
         minSdk = 29 // L2CAP CoC (createInsecureL2capChannel) requires API 29+
     }
 
+    // android-r2-01/-03/-05: the driver gates its test/automation + plaintext-mirror + verbose-log
+    // surfaces on BuildConfig.DEBUG, so a release consumer strips them without a source flag. A
+    // library's BuildConfig.DEBUG tracks the CONSUMING app's build type (debug lib for a debug app,
+    // release lib for a release app), so a release APK compiles with these affordances gone.
+    buildFeatures { buildConfig = true }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
