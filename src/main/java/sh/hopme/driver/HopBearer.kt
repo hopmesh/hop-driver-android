@@ -85,7 +85,16 @@ class HopBearer private constructor(private val context: Context, private val co
     val hopsResults = mutableStateMapOf<String, String>()
     private val pendingHops = HashMap<String, String>()              // domain → path awaiting resolve
     private val hopsReqs = HashMap<List<Byte>, String>()             // request id → domain
-    private val dohClient = OkHttpClient()
+    // DoH client for DNSSEC-chain fetches (§30). BOUNDED concurrency: fetchDnssecChain enqueues one GET
+    // per zone/record, so a burst of resolves (a page that references many hops:// domains, or a flood of
+    // takeDnsLookups) could otherwise spawn an unbounded number of in-flight HTTPS requests and exhaust
+    // sockets/threads. Cap the dispatcher so excess calls queue instead of all firing at once.
+    private val dohClient = OkHttpClient.Builder()
+        .dispatcher(okhttp3.Dispatcher().apply {
+            maxRequests = DOH_MAX_CONCURRENT              // total in-flight GETs across all domains
+            maxRequestsPerHost = DOH_MAX_CONCURRENT       // all go to one host (dns.google), so cap it too
+        })
+        .build()
     // HNS cache debug view: domain → (address, ttl).
     val hnsCache = mutableStateListOf<HnsCacheRow>()
     data class HnsCacheRow(val domain: String, val address: ByteArray, val ttlSecs: UInt)
@@ -201,6 +210,7 @@ class HopBearer private constructor(private val context: Context, private val co
                 if (relaysOnVal) onUi { relayStatus.value = "connected" }
             }
             core.post {
+                if (torndown) return@post   // a late link event after teardown must not touch a closed node
                 bearerLinks.add(link)
                 linkFlow.linkUp(link, t)   // quality-net-07: start per-link tx/rx counters
                 node.connected(link.toULong(), role == sh.hop.HopRole.DIALER)
@@ -208,7 +218,7 @@ class HopBearer private constructor(private val context: Context, private val co
             }
         }
         override fun linkBytes(link: Long, bytes: ByteArray) {
-            core.post { linkFlow.onRx(link, bytes.size); node.received(link.toULong(), bytes); pump() }
+            core.post { if (torndown) return@post; linkFlow.onRx(link, bytes.size); node.received(link.toULong(), bytes); pump() }
         }
         override fun linkDown(link: Long) {
             // android-11: the manager already dropped the transport mapping, so recognize the relay link
@@ -217,6 +227,7 @@ class HopBearer private constructor(private val context: Context, private val co
             android.util.Log.i("HOPLOG", "LINKFLOW SEAM DOWN g=$link${if (wasRelay) " xport=Relay" else ""}")
             if (wasRelay && relaysOnVal) onUi { relayStatus.value = "reconnecting…" }
             core.post {
+                if (torndown) return@post   // a late linkDown after teardown must not touch a closed node
                 bearerLinks.remove(link)
                 linkFlow.linkDown(link)   // quality-net-07: stop per-link tx/rx counters
                 node.disconnected(link.toULong())
@@ -227,6 +238,9 @@ class HopBearer private constructor(private val context: Context, private val co
 
     @Volatile var appInForeground = false
     private var started = false
+    // Set by teardown() so the self-reposting tick loop stops re-arming and so a late core task after
+    // shutdown is a no-op. Read on core (the tick loop) and set from teardown (which hops to core).
+    @Volatile private var torndown = false
 
     fun start(name: String = config.deviceName) = core.post {
         if (started) return@post
@@ -307,6 +321,7 @@ class HopBearer private constructor(private val context: Context, private val co
         var ticks = 0
         core.postDelayed(object : Runnable {
             override fun run() {
+                if (torndown) return   // teardown() stops the loop re-arming; don't touch a closed node
                 node.tick(nowMs())
                 if (++ticks % 20 == 0) publishPresence()
                 // Re-publish our prekey periodically so a neighbour whose cached copy lapsed
@@ -329,9 +344,34 @@ class HopBearer private constructor(private val context: Context, private val co
                 // whose data/tx climbs fast on idle (the historical gossip-flood regression) vs a healthy
                 // link that grows slowly. Empty (no lines) when there are no bearer links.
                 if (ticks % 5 == 0) for (l in linkFlow.lines()) android.util.Log.i("HOPLOG", l)
-                core.postDelayed(this, 1000)
+                if (!torndown) core.postDelayed(this, 1000)
             }
         }, 1000)
+    }
+
+    /// Release every long-lived resource this driver owns: the shared bearers (radios/sockets), the DoH
+    /// HTTP client, the serial core HandlerThread, and the libhop node handle. Without this, an
+    /// enable/disable cycle (or a service teardown) leaked the "hop.core" thread, the BearerManager's
+    /// radios + the RelayBearer's socket/executor, the OkHttp DoH dispatcher pool, and the native node.
+    /// Idempotent + safe to call from any thread; the actual node close runs on core (its only caller)
+    /// AFTER the tick loop and pending work drain, so nothing touches a freed handle. Mirrors the
+    /// executor/link cleanup the RelayBearer got.
+    fun teardown() {
+        if (torndown) return
+        torndown = true
+        started = false
+        // Stop the radios/sockets first so no new link event races the node close.
+        runCatching { bearerMgr.stop() }
+        // Release the DoH client's dispatcher thread pool + connection pool (bounded, but still held).
+        runCatching { dohClient.dispatcher.executorService.shutdown() }
+        runCatching { dohClient.connectionPool.evictAll() }
+        // Drain the core queue THEN close the node + quit the thread, so any already-queued node work
+        // finishes before the handle is freed (closing under an in-flight node.* call is a use-after-free).
+        core.post {
+            core.removeCallbacksAndMessages(null)   // drop the self-reposting tick + any pending tasks
+            runCatching { node.close() }            // free the libhop handle (UniFFI AutoCloseable)
+            coreThread.quitSafely()                 // stop the serial core HandlerThread
+        }
     }
 
     /// Re-publish our presence advert so it stays within TTL and renames propagate.
@@ -921,10 +961,26 @@ class HopBearer private constructor(private val context: Context, private val co
     /// Pin this device to a single relay by direct address (persisted), or pass null to clear the pin
     /// and fall back to the anycast default. The shared RelayBearer reads this pin at start(), so the
     /// pin takes effect on the next launch; we persist it and reflect it in the UI now.
-    fun setPinnedRelay(url: String?) {
-        val pinned = url?.trim()?.takeIf { it.isNotEmpty() }
+    fun setPinnedRelay(url: String?): Boolean {
+        val raw = url?.trim()
+        // Clearing the pin (null/blank) is always allowed → fall back to the anycast default.
+        if (raw.isNullOrEmpty()) {
+            pinnedRelay.value = null
+            prefs.edit().remove("pinnedRelay").apply()
+            return true
+        }
+        // Validate BEFORE persisting: junk (or an http:// / random text) would be handed straight to the
+        // RelayBearer's OkHttp WebSocket dial at the next launch and fail obscurely. Reject it here so a
+        // bad pin never latches into prefs (the device only ever talks to ONE relay — a bad pin is a
+        // silent outage). Accepts wss:// / https:// / ws:// URLs and bare host:port (raw-TCP path A).
+        val pinned = validateRelayUrl(raw)
+        if (pinned == null) {
+            android.util.Log.w("HOPLOG", "setPinnedRelay rejected malformed url")
+            return false
+        }
         pinnedRelay.value = pinned
-        prefs.edit().apply { if (pinned != null) putString("pinnedRelay", pinned) else remove("pinnedRelay") }.apply()
+        prefs.edit().putString("pinnedRelay", pinned).apply()
+        return true
     }
 
     // MARK: chat-history persistence (survives app restart) ----------------------
@@ -1252,6 +1308,9 @@ class HopBearer private constructor(private val context: Context, private val co
         const val PRESENCE_SERVICE = "presence"
         const val PRESENCE_TTL_MS: UInt = 600_000u
         const val DEFAULT_RELAY = "wss://relay.hopme.sh/"
+        /// Cap on simultaneously in-flight DoH (DNSSEC-chain) GETs so a burst of hops:// resolves can't
+        /// spawn unbounded concurrent HTTPS requests; excess calls queue on the dispatcher instead.
+        const val DOH_MAX_CONCURRENT = 6
         /// Shared app secret for Hop Debug — all our demo devices use it so they interoperate.
         /// A different app (different secret) can't see or join these channels (DESIGN.md §32).
         val APP_SECRET = ByteArray(32) { 0x48 } // "H" ×32 — dev build only (matches iOS)
@@ -1358,5 +1417,38 @@ class HopBearer private constructor(private val context: Context, private val co
 
         /// A single link is "direct" (0 relays); ≥2 shows the count.
         fun hopsLabel(h: UByte): String = if (h.toInt() <= 1) "direct" else "$h hops"
+
+        /// Validate + normalize a user-entered relay URL before it is persisted as the pinned relay.
+        /// The shared RelayBearer dials this over an OkHttp WebSocket (`Request.url(...)`), which accepts
+        /// only ws/wss/https/http schemes and requires a non-empty host. Returns the trimmed URL if it is
+        /// a well-formed wss:// / https:// (or ws:// / http://) URL with a host, else null — so junk, a
+        /// bare word, or a random string never latches into prefs as a silent relay outage. Pure + host-
+        /// free so it is unit-testable on a plain JVM.
+        fun validateRelayUrl(input: String): String? {
+            val s = input.trim()
+            if (s.isEmpty()) return null
+            val lower = s.lowercase()
+            val scheme = when {
+                lower.startsWith("wss://") -> "wss://"
+                lower.startsWith("https://") -> "https://"
+                lower.startsWith("ws://") -> "ws://"
+                lower.startsWith("http://") -> "http://"
+                else -> return null   // must be an explicit ws/wss/https/http URL, not a bare host or junk
+            }
+            // Host is everything after the scheme up to the first '/', '?' or '#'. Reject an empty host
+            // ("wss://", "wss:///path"), a host that is only a port (":9443"), and whitespace anywhere.
+            if (s.any { it.isWhitespace() }) return null
+            val afterScheme = s.substring(scheme.length)
+            val hostPort = afterScheme.takeWhile { it != '/' && it != '?' && it != '#' }
+            val host = hostPort.substringBefore(':')
+            if (host.isEmpty()) return null
+            // A port, if present, must be a valid 1..65535 number.
+            val portPart = hostPort.substringAfter(':', "")
+            if (portPart.isNotEmpty()) {
+                val port = portPart.toIntOrNull() ?: return null
+                if (port !in 1..65535) return null
+            }
+            return s
+        }
     }
 }
