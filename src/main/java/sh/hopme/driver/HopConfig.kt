@@ -15,8 +15,12 @@ data class HopConfig(
     val appSecret: ByteArray,
     val deviceName: String,
     val relayUrl: String = HopBearer.DEFAULT_RELAY,
-    /** When false the bearer never dials the backbone relay — pure P2P (BLE/LAN/Wi-Fi Direct) only. */
-    val relaysEnabled: Boolean = true,
+    /** When false the bearer never dials the backbone relay — pure P2P (BLE/LAN/Wi-Fi Direct) only.
+     *  android-09: defaults FALSE to match the deployed-off fleet (relays_enabled=false in infra), so a
+     *  bare-service restart never wakes the radio every ~31s to dial a dead endpoint. A caller that
+     *  wants the relay must opt in explicitly, and [HopBearer] still ANDs this with a runtime killswitch
+     *  (the `relaysEnabled` pref) so the fleet can be turned off without an app update. */
+    val relaysEnabled: Boolean = false,
     val notificationIcon: Int = android.R.drawable.ic_dialog_email,
     /** 32-byte SQLCipher key for `hop.db` at rest (F-25). Empty = open plain. Only encrypts when
      *  libhop is built `--features sqlcipher`. Defaults to the device-derived [HopBearer.dbKey]. */

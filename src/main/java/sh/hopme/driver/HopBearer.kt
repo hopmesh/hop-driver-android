@@ -164,8 +164,33 @@ class HopBearer private constructor(private val context: Context, private val co
     // Adapts the shared BearerManager to the node seam. Every link from a bearer surfaces here and
     // drives node.connected/received/disconnected (linkId mismatch: the bearer libs use Long, the node
     // uses ULong — convert at this boundary).
+    // android-09: the effective relay switch — the caller's config AND'd with a runtime killswitch pref,
+    // so the deployed-off fleet stays off without an app update. Set once in start().
+    @Volatile private var relaysOnVal = false
+    /// android-09: relays run only when the caller opted in AND the runtime killswitch is on. The pref
+    /// defaults to the config value, so an operator/remote-config can force relays OFF (fleet torn down)
+    /// without shipping a new build; it never force-ENABLES a config that opted out.
+    private fun relaysEffectivelyEnabled(): Boolean =
+        config.relaysEnabled && prefs.getBoolean("relaysEnabled", config.relaysEnabled)
+
+    // android-11: global link ids currently on the "Relay" transport, so linkDown can recognize a relay
+    // drop even though BearerManager forgets the transport mapping BEFORE it calls linkDown(). Touched
+    // only from the manager's sink callbacks (one thread), but kept synchronized as a cheap guard.
+    private val relayLinks = java.util.Collections.synchronizedSet(HashSet<Long>())
     private val bearerSink = object : sh.hop.LinkSink {
         override fun linkUp(link: Long, role: sh.hop.HopRole, peerId: ByteArray) {
+            // android-03: LINKFLOW at the manager seam — the GLOBAL link id + transport + peer, so a soak
+            // can correlate a bearer-local "LINKFLOW LINK UP link=<local>" line with the node-facing
+            // connected()/disconnected() churn. This is where the previously-missing bearer↔global↔node
+            // link correlation gets stitched.
+            val t = bearerMgr.transportNameOf(link) ?: "?"
+            android.util.Log.i("HOPLOG", "LINKFLOW SEAM UP g=$link xport=$t role=$role peer=${peerId.take(6).joinToString("") { "%02x".format(it) }}")
+            // android-11: infer relay status from the manager's link events — the RelayBearer surfaces its
+            // one link with transportName "Relay", so a live relay link IS the honest "connected" signal.
+            if (t == "Relay") {
+                relayLinks.add(link)
+                if (relaysOnVal) onUi { relayStatus.value = "connected" }
+            }
             core.post {
                 bearerLinks.add(link)
                 node.connected(link.toULong(), role == sh.hop.HopRole.DIALER)
@@ -176,6 +201,11 @@ class HopBearer private constructor(private val context: Context, private val co
             core.post { node.received(link.toULong(), bytes); pump() }
         }
         override fun linkDown(link: Long) {
+            // android-11: the manager already dropped the transport mapping, so recognize the relay link
+            // from the set we recorded at linkUp instead of transportNameOf().
+            val wasRelay = relayLinks.remove(link)
+            android.util.Log.i("HOPLOG", "LINKFLOW SEAM DOWN g=$link${if (wasRelay) " xport=Relay" else ""}")
+            if (wasRelay && relaysOnVal) onUi { relayStatus.value = "reconnecting…" }
             core.post {
                 bearerLinks.remove(link)
                 node.disconnected(link.toULong())
@@ -225,13 +255,18 @@ class HopBearer private constructor(private val context: Context, private val co
         // Cloud relay (WebSocket) as a shared bearer — ONE outbound link to the backbone, registered
         // only when relays are enabled and a URL exists. (P2P test mode sets relaysEnabled=false, so
         // this stays unregistered.)
-        if (config.relaysEnabled) {
+        val relaysOn = relaysEffectivelyEnabled()
+        relaysOnVal = relaysOn
+        if (relaysOn) {
             val relay = prefs.getString("pinnedRelay", null) ?: config.relayUrl
             if (relay.isNotEmpty())
                 bearerMgr.register(sh.hopme.bearers.relay.RelayBearer(relay))
         }
         bearerMgr.start()
-        android.util.Log.i("HOPLOG", "shared bearers started (BLE+LAN${if (config.relaysEnabled) "+Relay" else ""}) id=${bearerId.take(4).joinToString("") { "%02x".format(it) }}")
+        // android-10: the mesh is up, so drive status off "starting…" so the UI reflects the live state
+        // (it was previously never written again, leaving Status stuck on "starting…" forever).
+        onUi { status.value = "running" }
+        android.util.Log.i("HOPLOG", "shared bearers started (BLE+LAN${if (relaysOn) "+Relay" else ""}) id=${bearerId.take(4).joinToString("") { "%02x".format(it) }}")
         // Declare internet reachability so the node resolves HNS itself by servicing
         // takeDnsLookups() (DESIGN.md §30). Track the default network so it stays accurate.
         val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
@@ -252,8 +287,9 @@ class HopBearer private constructor(private val context: Context, private val co
         privateModeVal = priv
         onUi { pinnedRelay.value = pinned; privateMode.value = priv }
         // The shared RelayBearer owns the cloud relay. Surface "disabled" in pure-P2P mode so the UI
-        // reflects it (HopConfig.relaysEnabled=false); otherwise the RelayBearer reports its status.
-        if (!config.relaysEnabled) onUi { relayStatus.value = "disabled" }
+        // reflects it (relays off); otherwise seed "connecting…" and let bearerSink flip it to
+        // "connected"/"reconnecting…" on the relay link's up/down events (android-09/11).
+        onUi { relayStatus.value = if (relaysOn) "connecting…" else "disabled" }
         var ticks = 0
         core.postDelayed(object : Runnable {
             override fun run() {
@@ -263,6 +299,7 @@ class HopBearer private constructor(private val context: Context, private val co
                 // (or who arrived later) can always open a forward-secret session to us (§25).
                 if (ticks % 120 == 0) runCatching { node.publishPrekey() }
                 if (ticks % 15 == 0) android.util.Log.i("HOPLOG", "HOPAUTO self=$myAddressVal name=${config.deviceName}")  // periodic, so the harness always finds it
+                expireHopsWeb()   // android-13: fail out WebView fetches whose resolve/response never arrived
                 pump()
                 // DIAG: node link state each tick. peerLinks() maps each Up link to its peer address,
                 // so a link that is UP but stuck (no peerLinks) shows the Noise handshake never
@@ -720,8 +757,12 @@ class HopBearer private constructor(private val context: Context, private val co
     }
 
     // hops:// for the WebView (callback-style, per resource — DESIGN.md §30).
-    private val hopsWebPending = HashMap<String, MutableList<Pair<String, (Int, String, ByteArray) -> Unit>>>()
-    private val hopsWebReqs = HashMap<List<Byte>, (Int, String, ByteArray) -> Unit>()
+    // android-13: each WebView callback carries a deadline so a resolve/response that never arrives
+    // (dead domain, dropped request) is expired instead of latching a dead callback forever. Expiry
+    // matches the 30s UI timeout; the entries are touched only on the core thread.
+    private val hopsWebPending = HashMap<String, MutableList<Triple<String, (Int, String, ByteArray) -> Unit, Long>>>()
+    private val hopsWebReqs = HashMap<List<Byte>, Pair<(Int, String, ByteArray) -> Unit, Long>>()
+    private val HOPS_WEB_TTL_MS = 30_000L
 
     /// Fetch one hops:// resource for the WebView, calling back with (status, contentType, body).
     fun hopsFetch(url: String, cb: (Int, String, ByteArray) -> Unit) {
@@ -732,10 +773,30 @@ class HopBearer private constructor(private val context: Context, private val co
                 is HnsLookupResult.Cached ->
                     if (r.address.isEmpty()) cb(502, "text/plain; charset=utf-8", "no hops endpoint for $domain".toByteArray())
                     else fireHopsWeb(domain, path, r.address, cb)
-                is HnsLookupResult.Pending -> hopsWebPending.getOrPut(domain) { mutableListOf() }.add(path to cb)
+                is HnsLookupResult.Pending -> hopsWebPending.getOrPut(domain) { mutableListOf() }.add(Triple(path, cb, System.currentTimeMillis() + HOPS_WEB_TTL_MS))
                 is HnsLookupResult.NeedsResolver -> cb(503, "text/plain; charset=utf-8", "offline".toByteArray())
             }
             pump()
+        }
+    }
+
+    /// android-13: expire WebView fetch callbacks whose HNS resolve or hops response never arrived, so a
+    /// dead domain / dropped request fails the UI (matching its 30s timeout) instead of latching a dead
+    /// callback + its WebView worker forever. Runs on core (same thread that populates the maps).
+    private fun expireHopsWeb() {
+        val now = System.currentTimeMillis()
+        val reqIt = hopsWebReqs.entries.iterator()
+        while (reqIt.hasNext()) {
+            val (cb, deadline) = reqIt.next().value
+            if (now >= deadline) { reqIt.remove(); cb(504, "text/plain; charset=utf-8", "timeout".toByteArray()) }
+        }
+        val penIt = hopsWebPending.entries.iterator()
+        while (penIt.hasNext()) {
+            val e = penIt.next()
+            e.value.removeAll { (_, cb, deadline) ->
+                (now >= deadline).also { if (it) cb(504, "text/plain; charset=utf-8", "timeout".toByteArray()) }
+            }
+            if (e.value.isEmpty()) penIt.remove()
         }
     }
 
@@ -745,7 +806,7 @@ class HopBearer private constructor(private val context: Context, private val co
             node.sendHopsRequest(endpoint, domain, "GET", path, ByteArray(0), 8u * 1024u * 1024u)
         }.getOrNull()
         if (id == null) { cb(502, "text/plain; charset=utf-8", "send failed".toByteArray()); return }
-        hopsWebReqs[id.toList()] = cb
+        hopsWebReqs[id.toList()] = cb to (System.currentTimeMillis() + HOPS_WEB_TTL_MS)
         pump()
     }
 
@@ -753,7 +814,7 @@ class HopBearer private constructor(private val context: Context, private val co
         for (rec in node.takeHnsResults()) {
             // WebView fetches queued on this domain's resolution take priority.
             hopsWebPending.remove(rec.domain)?.let { queued ->
-                for ((path, cb) in queued) {
+                for ((path, cb, _) in queued) {
                     if (rec.address.isEmpty()) cb(502, "text/plain; charset=utf-8", "no hops endpoint for ${rec.domain}".toByteArray())
                     else fireHopsWeb(rec.domain, path, rec.address, cb)
                 }
@@ -763,7 +824,7 @@ class HopBearer private constructor(private val context: Context, private val co
             else fireHops(rec.domain, path, rec.address)
         }
         for (resp in node.takeHttpResponses()) {
-            val webCb = hopsWebReqs.remove(resp.forRequestId.toList())
+            val webCb = hopsWebReqs.remove(resp.forRequestId.toList())?.first
             if (webCb != null) { webCb(resp.status.toInt(), resp.contentType, resp.body); continue }
             val domain = hopsReqs.remove(resp.forRequestId.toList()) ?: continue
             val line = "${resp.status} · ${String(resp.body)}"
@@ -837,7 +898,32 @@ class HopBearer private constructor(private val context: Context, private val co
 
     private val messagesFile get() = java.io.File(context.filesDir, "messages.json")
     private val contactsFile get() = java.io.File(context.filesDir, "contacts.json")
+    /// Image blobs live here as individual content-addressed files, referenced by name from
+    /// messages.json (android-12). This keeps the mirror JSON small so the debounced rewrite doesn't
+    /// re-base64 megabytes of photo bytes on every message burst.
+    private val mediaDir get() = java.io.File(context.filesDir, "media").apply { mkdirs() }
+    /// Content hashes already flushed to [mediaDir]; lets writeMessages skip re-writing unchanged blobs.
+    private val writtenMedia = java.util.Collections.synchronizedSet(HashSet<String>())
     private var lastContactSaveMs = 0L
+
+    /// Store [bytes] as a content-addressed file under [mediaDir] and return its reference name. The
+    /// same image (by SHA-256) is written at most once; a re-send of the same photo dedupes on disk.
+    private fun putMedia(bytes: ByteArray): String {
+        val name = mediaName(bytes)
+        if (writtenMedia.add(name)) {
+            val f = java.io.File(mediaDir, name)
+            if (!f.exists()) runCatching { f.writeBytes(bytes) }
+        }
+        return name
+    }
+
+    private fun getMedia(name: String): ByteArray? =
+        runCatching { java.io.File(mediaDir, name).readBytes() }.getOrNull()
+
+    private fun mediaName(bytes: ByteArray): String {
+        val h = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        return android.util.Base64.encodeToString(h, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING)
+    }
 
     /// Add a contact by base58 address (manual entry or scanned QR). Returns false if invalid.
     /// An empty name resolves via hop.identify; a provided name is kept as the local alias.
@@ -897,33 +983,44 @@ class HopBearer private constructor(private val context: Context, private val co
         core.postDelayed({ saveScheduled = false; writeMessages() }, 1000)
     }
 
+    /// Snapshot the message list on the caller (core thread, the only writer of `messages`), externalize
+    /// image blobs, then serialize + write the JSON on a background thread. Image bytes are stored as
+    /// separate content-addressed files (android-12) and referenced by name, so the mirror stays small
+    /// and the debounced rewrite never re-base64s photo bytes on the core/main path.
     private fun writeMessages() {
-        val arr = org.json.JSONArray()
-        for (m in messages) {
-            val o = org.json.JSONObject()
-            o.put("peer", m.peer); o.put("text", m.text); o.put("incoming", m.incoming)
-            o.put("contentType", m.contentType)
-            m.imageData?.let { o.put("imageData", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
-            if (m.images.isNotEmpty()) {
-                val imgs = org.json.JSONArray()
-                m.images.forEach { imgs.put(android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
-                o.put("images", imgs)
-            }
-            o.put("hops", m.hops.toInt())
-            m.latencyMs?.let { o.put("latencyMs", it.toLong()) }
-            if (m.trace.isNotEmpty()) o.put("trace", org.json.JSONArray(m.trace))
-            o.put("sentAt", m.sentAt)
-            m.deliveredAt?.let { o.put("deliveredAt", it) }
-            o.put("relayed", m.relayed.toLong())
-            o.put("delivered", m.delivered); o.put("deliveryHops", m.deliveryHops.toInt())
-            m.deliveryMs?.let { o.put("deliveryMs", it.toLong()) } // forward-path (A→B) latency
-            o.put("failed", m.failed)
-            // Keep the bundleId: the node re-sprays undelivered own-bundles after restart (node.rs
-            // rehydrate); persisting it lets refresh() re-query messageStatus and flip to Delivered.
-            m.bundleId?.let { o.put("bundleId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
-            arr.put(o)
+        val snapshot = messages.toList()
+        // Externalize images to disk here (dedupes via writtenMedia); the JSON build below just refs.
+        val imgRefs = HashMap<Long, Pair<String?, List<String>>>()
+        for (m in snapshot) {
+            val single = m.imageData?.let { putMedia(it) }
+            val multi = if (m.images.isNotEmpty()) m.images.map { putMedia(it) } else emptyList()
+            if (single != null || multi.isNotEmpty()) imgRefs[m.localId] = single to multi
         }
-        runCatching { messagesFile.writeText(arr.toString()) }
+        thread(name = "save-messages") {
+            val arr = org.json.JSONArray()
+            for (m in snapshot) {
+                val o = org.json.JSONObject()
+                o.put("peer", m.peer); o.put("text", m.text); o.put("incoming", m.incoming)
+                o.put("contentType", m.contentType)
+                val refs = imgRefs[m.localId]
+                refs?.first?.let { o.put("imageRef", it) }
+                refs?.second?.takeIf { it.isNotEmpty() }?.let { o.put("imageRefs", org.json.JSONArray(it)) }
+                o.put("hops", m.hops.toInt())
+                m.latencyMs?.let { o.put("latencyMs", it.toLong()) }
+                if (m.trace.isNotEmpty()) o.put("trace", org.json.JSONArray(m.trace))
+                o.put("sentAt", m.sentAt)
+                m.deliveredAt?.let { o.put("deliveredAt", it) }
+                o.put("relayed", m.relayed.toLong())
+                o.put("delivered", m.delivered); o.put("deliveryHops", m.deliveryHops.toInt())
+                m.deliveryMs?.let { o.put("deliveryMs", it.toLong()) } // forward-path (A→B) latency
+                o.put("failed", m.failed)
+                // Keep the bundleId: the node re-sprays undelivered own-bundles after restart (node.rs
+                // rehydrate); persisting it lets refresh() re-query messageStatus and flip to Delivered.
+                m.bundleId?.let { o.put("bundleId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
+                arr.put(o)
+            }
+            runCatching { messagesFile.writeText(arr.toString()) }
+        }
     }
 
     private fun loadMessages() {
@@ -934,14 +1031,23 @@ class HopBearer private constructor(private val context: Context, private val co
             val o = arr.getJSONObject(i)
             val incoming = o.getBoolean("incoming")
             val delivered = o.optBoolean("delivered", false)
-            val imgs = o.optJSONArray("images")?.let { a ->
+            // New format: images referenced by content-addressed file name (android-12). Legacy format:
+            // inline base64 under "imageData"/"images", still read so old mirrors keep working.
+            val single: ByteArray? = when {
+                o.has("imageRef") -> getMedia(o.getString("imageRef"))
+                o.has("imageData") -> android.util.Base64.decode(o.getString("imageData"), android.util.Base64.NO_WRAP)
+                else -> null
+            }
+            val imgs: List<ByteArray> = o.optJSONArray("imageRefs")?.let { a ->
+                (0 until a.length()).mapNotNull { getMedia(a.getString(it)) }
+            } ?: o.optJSONArray("images")?.let { a ->
                 (0 until a.length()).map { android.util.Base64.decode(a.getString(it), android.util.Base64.NO_WRAP) }
             } ?: emptyList()
             val trace = o.optJSONArray("trace")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
             loaded.add(Message(
                 localId = nextMsgId.getAndIncrement(), peer = o.getString("peer"), text = o.optString("text", ""),
                 incoming = incoming, contentType = o.optString("contentType", "text/plain"),
-                imageData = if (o.has("imageData")) android.util.Base64.decode(o.getString("imageData"), android.util.Base64.NO_WRAP) else null,
+                imageData = single,
                 images = imgs, hops = o.optInt("hops", 0).toUByte(),
                 latencyMs = if (o.has("latencyMs")) o.getLong("latencyMs").toULong() else null,
                 trace = trace, sentAt = o.optLong("sentAt", System.currentTimeMillis()),
@@ -1147,8 +1253,26 @@ class HopBearer private constructor(private val context: Context, private val co
         /// Compact base58 prefix for display (full base58 via `addressBase58`).
         fun shortHex(d: ByteArray): String = addressBase58(d).take(8)
 
-        /// 32-byte Ed25519 seed derived from the device (stable, storage-free — §4).
-        fun deviceSeed(context: Context): ByteArray {
+        /// 32-byte Ed25519 identity seed, hardware-backed (android-02 / sec-priv-03). A random secret is
+        /// generated ONCE and wrapped by a non-exportable AndroidKeyStore key (StrongBox when available),
+        /// so it has full 256-bit entropy and cannot be recomputed by anything that merely learns
+        /// ANDROID_ID (on-device code, a backup, forensics). Existing installs are preserved: the old
+        /// `SHA-256("hop.identity.v1|ANDROID_ID")` value is adopted as the stored secret on first run,
+        /// so the address does not change. See [KeystoreSecret].
+        fun deviceSeed(context: Context): ByteArray =
+            KeystoreSecret.getOrCreate(context, "identity.v1", legacy = legacyDeviceSeed(context))
+
+        /// 32-byte SQLCipher key for `hop.db` at rest (F-25), hardware-backed the same way as the
+        /// identity seed and domain-separated from it (its own Keystore key + pref entry). The key is
+        /// NOT in the db file and is unreadable off-device, so a pulled db is useless without this
+        /// device's secure element. Existing installs migrate from the old ANDROID_ID-derived key so the
+        /// already-encrypted db still opens. Encrypts only when libhop is built `--features sqlcipher`.
+        fun dbKey(context: Context): ByteArray =
+            KeystoreSecret.getOrCreate(context, "db.key.v1", legacy = legacyDbKey(context))
+
+        /// Legacy (pre-Keystore) identity seed: `SHA-256("hop.identity.v1|ANDROID_ID")`. Kept only as the
+        /// one-time migration seed so existing installs keep their address; never the primary source.
+        private fun legacyDeviceSeed(context: Context): ByteArray {
             val androidId = android.provider.Settings.Secure.getString(
                 context.contentResolver, android.provider.Settings.Secure.ANDROID_ID
             ) ?: "hop-fallback"
@@ -1156,14 +1280,8 @@ class HopBearer private constructor(private val context: Context, private val co
                 .digest("hop.identity.v1|$androidId".toByteArray())
         }
 
-        /// 32-byte SQLCipher key for `hop.db` at rest (F-25). Domain-separated from the identity seed
-        /// but derived from the same ANDROID_ID basis: stable every launch with no storage to fail,
-        /// tied to identity lifetime (a factory reset / reinstall resets both together), and NOT in the
-        /// db file, so a pulled db is useless without the device. A random key in the Android Keystore
-        /// (StrongBox) is the stronger upgrade; the device-derived key mirrors the identity approach and
-        /// avoids a keystore that could wipe the db on backup/restore. Encrypts only when libhop is
-        /// built `--features sqlcipher`.
-        fun dbKey(context: Context): ByteArray {
+        /// Legacy (pre-Keystore) db key: `SHA-256("hop.db.key.v1|ANDROID_ID")`. Migration seed only.
+        private fun legacyDbKey(context: Context): ByteArray {
             val androidId = android.provider.Settings.Secure.getString(
                 context.contentResolver, android.provider.Settings.Secure.ANDROID_ID
             ) ?: "hop-fallback"
