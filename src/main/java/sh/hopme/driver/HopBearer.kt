@@ -20,6 +20,7 @@ import okhttp3.Response
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import uniffi.hop.HopNode
+import uniffi.hop.HopNodeInterface
 import uniffi.hop.HnsLookupResult
 import uniffi.hop.HpsKind
 import uniffi.hop.TraceHopInfo
@@ -35,7 +36,16 @@ import uniffi.hop.serviceIdentify
  * protocol work, only shuttles bytes via connected / received / drainOutgoing.
  */
 @SuppressLint("MissingPermission")
-class HopBearer private constructor(private val context: Context, private val config: HopConfig) {
+class HopBearer internal constructor(
+    private val context: Context,
+    private val config: HopConfig,
+    // cov/android-driver test seam: an already-built node injected by the driver's own unit tests,
+    // bypassing the [node] field-initializer's HopNode.openKeyed below (which loads libhop.so and can't
+    // run on a plain JVM). This constructor is `internal`, so only the driver module can reach it; the
+    // app (a separate Gradle module) still MUST go through [shared]. Production passes null (see the
+    // 2-arg secondary constructor), so the initializer opens the real keyed node exactly as before.
+    injectedNode: HopNodeInterface?,
+) {
 
     data class Peer(
         val address: ByteArray, val name: String, val hops: UByte,
@@ -60,12 +70,22 @@ class HopBearer private constructor(private val context: Context, private val co
     // persists messages across restarts. Both come from the host-supplied HopConfig.
     // F-25: open SQLCipher-encrypted with the device-derived db key (empty ⇒ plain). Only encrypts
     // when libhop is built `--features sqlcipher` (android/build-aar.sh, on by default).
-    val node: HopNode = HopNode.openKeyed(
+    // Typed to the UniFFI-generated HopNodeInterface (not the concrete HopNode) so a unit test can
+    // inject an in-memory fake; production passes injectedNode=null and this initializer opens the real
+    // keyed node, byte-for-byte the same openKeyed call as before the seam was added.
+    val node: HopNodeInterface = injectedNode ?: HopNode.openKeyed(
         config.dbPath,
         config.identitySecret,
         config.appSecret,
         config.dbKey,
     )
+
+    /**
+     * Production constructor: no injected node, so the [node] initializer opens the real keyed libhop
+     * node (SQLCipher at rest when built `--features sqlcipher`). Behavior-identical to the prior
+     * behavior; [shared] uses this path.
+     */
+    private constructor(context: Context, config: HopConfig) : this(context, config, null)
     val peers = mutableStateListOf<Peer>()
     /// Persistent address book: everyone we've seen, messaged, or been messaged by, keyed by address.
     /// `seen` is the subset NOT currently reachable — so past conversations stay reachable even when
@@ -157,6 +177,9 @@ class HopBearer private constructor(private val context: Context, private val co
     private val coreThread = HandlerThread("hop.core").apply { start() }
     private val core = Handler(coreThread.looper)
     private val main = Handler(Looper.getMainLooper())
+    /** cov/android-driver test seam: the serial core looper, so a Robolectric test can flush the
+     *  background HandlerThread deterministically with ShadowLooper.idle()/idleFor(). No production use. */
+    internal val coreLooper: Looper get() = coreThread.looper
     /// Marshal a Compose-state update to the main thread. UI (snapshot) state mutates ONLY here.
     private fun onUi(block: () -> Unit) { main.post(block) }
     private var lastPeerLinkCount = -1
@@ -378,7 +401,10 @@ class HopBearer private constructor(private val context: Context, private val co
         // finishes before the handle is freed (closing under an in-flight node.* call is a use-after-free).
         core.post {
             core.removeCallbacksAndMessages(null)   // drop the self-reposting tick + any pending tasks
-            runCatching { node.close() }            // free the libhop handle (UniFFI AutoCloseable)
+            // close() is on the concrete HopNode (AutoCloseable), not on HopNodeInterface (the seam type).
+            // The real production node IS AutoCloseable, so this still frees the libhop handle; a unit
+            // test's in-memory fake that doesn't implement AutoCloseable is simply a no-op here.
+            runCatching { (node as? AutoCloseable)?.close() }
             coreThread.quitSafely()                 // stop the serial core HandlerThread
         }
     }
@@ -936,7 +962,7 @@ class HopBearer private constructor(private val context: Context, private val co
         val bodies = java.util.Collections.synchronizedList(ArrayList<String>())
         val remaining = java.util.concurrent.atomic.AtomicInteger(queries.size)
         for ((name, qtype) in queries) {
-            val req = Request.Builder().url("https://dns.google/resolve?name=$name&type=$qtype&do=1").build()
+            val req = Request.Builder().url("${config.dohResolverUrl}?name=$name&type=$qtype&do=1").build()
             dohClient.newCall(req).enqueue(object : okhttp3.Callback {
                 override fun onFailure(call: okhttp3.Call, e: java.io.IOException) { done() }
                 override fun onResponse(call: okhttp3.Call, response: Response) {

@@ -25,6 +25,10 @@ data class HopConfig(
     /** 32-byte SQLCipher key for `hop.db` at rest (F-25). Empty = open plain. Only encrypts when
      *  libhop is built `--features sqlcipher`. Defaults to the device-derived [HopBearer.dbKey]. */
     val dbKey: ByteArray = ByteArray(0),
+    /** DNS-over-HTTPS resolver endpoint for the DNSSEC-chain fetch (§30). Defaults to Google Public
+     *  DNS (the value the driver previously hard-coded); host code can point it elsewhere, and the unit
+     *  suite points it at a MockWebServer so the fetch is exercised without real network. */
+    val dohResolverUrl: String = "https://dns.google/resolve",
 ) {
     companion object {
         /// android-r2-02: the ONE persisted pref both init paths read for the relay flag, so a
