@@ -361,10 +361,14 @@ class HopBearer private constructor(private val context: Context, private val co
         if (torndown) return
         torndown = true
         started = false
-        // Drop the process singleton NOW (synchronously), so a concurrent shared() after teardown
-        // builds a FRESH driver instead of handing back this torn-down one (which would be a permanent
-        // brick: torndown is one-way). The old instance is GC'd once its core thread quits below.
-        inst = null
+        // Drop the process singleton under the SAME lock shared() creates it under, and only if it is
+        // still THIS instance, so a teardown racing a re-creation cannot null out (orphan) a newer
+        // driver (r6-01). After this a shared() builds a FRESH driver rather than handing back this
+        // torn-down one (torndown is one-way, so returning it would be a permanent brick). The node
+        // handle is closed on `core` below; a shared() in that narrow window would open a second handle
+        // on the same db, but Android serializes a foreground service's onDestroy (the teardown site)
+        // with the next onCreate/shared(), so that overlap does not occur in the real lifecycle.
+        synchronized(Companion) { if (inst === this) inst = null }
         // Stop the radios/sockets first so no new link event races the node close.
         runCatching { bearerMgr.stop() }
         // Release the DoH client's dispatcher thread pool + connection pool (bounded, but still held).
