@@ -10,7 +10,7 @@ import org.junit.Test
  * singleton's two init paths (a user-launched activity vs an OS START_STICKY service restart).
  *
  * The regression: MainActivity hardcoded `relaysEnabled = true` while HopConfig.default hardcoded
- * `false`, so which behavior a device got depended on WHICH path minted the singleton first — same
+ * `false`, so which behavior a device got depended on WHICH path minted the singleton first - same
  * binary, two network behaviors. The fix single-sources the flag through one persisted pref, resolved
  * by [HopConfig.resolveRelaysEnabled]. These pin that, given the SAME persisted value, both paths agree.
  */
@@ -36,7 +36,7 @@ class RelayFlagTest {
 
     @Test fun freshInstallDefaultsOffAndAgrees() {
         // Before the activity has ever persisted a choice (nothing stored), BOTH paths fall back to the
-        // deployed-off default — deterministically off, never "on for the activity, off for the service".
+        // deployed-off default - deterministically off, never "on for the activity, off for the service".
         assertFalse("deployed-off fleet default (android-09)", activityPath(null))
         assertFalse(servicePath(null))
         assertEquals(activityPath(null), servicePath(null))

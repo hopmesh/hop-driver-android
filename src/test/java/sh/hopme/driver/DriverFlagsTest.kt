@@ -13,7 +13,7 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * The automation send hook and the address/text-leaking HOPLOG lines are gated on [DriverFlags], which
  * defaults to BuildConfig.DEBUG. Unit tests run against the DEBUG variant (so the defaults are true),
- * but the gates must actually be consulted — these flip the flags and pin that the release posture (all
+ * but the gates must actually be consulted - these flip the flags and pin that the release posture (all
  * off) is expressible, and that the notification id no longer collides.
  */
 class DriverFlagsTest {

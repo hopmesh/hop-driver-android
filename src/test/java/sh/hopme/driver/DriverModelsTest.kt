@@ -10,7 +10,7 @@ import org.junit.Test
  * quality-cov: the driver's plain app-model value types (HopBearer.Peer / Message / QueueRow +
  * HnsCacheRow / HpsMsg). These are pure Kotlin data holders the UI observes; constructing them exercises
  * the generated constructors, the many defaulted Message fields (the incoming-vs-outgoing metadata), and
- * the derived flags. No node, no Context, no radios. (HpsTopic.id is deliberately not touched here — it
+ * the derived flags. No node, no Context, no radios. (HpsTopic.id is deliberately not touched here - it
  * calls the native addressBase58, so it lives with the device-gated surface.)
  */
 class DriverModelsTest {

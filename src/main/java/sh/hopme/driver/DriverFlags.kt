@@ -9,7 +9,7 @@ package sh.hopme.driver
  *   - android-r2-03: the send-as-user automation hook is inert (defense in depth beside the manifest).
  *
  * (android-r2-01's plaintext-mirror defect is fixed by ENCRYPTING the mirrors at rest with the
- * Keystore-wrapped db key via [MirrorCrypto], NOT by a debug flag — so history survives in both debug
+ * Keystore-wrapped db key via [MirrorCrypto], NOT by a debug flag - so history survives in both debug
  * and release while a forensic/backup extract can no longer read cleartext bodies or the address book.)
  *
  * These are `@JvmStatic var` on a singleton so a JVM unit test can flip them to exercise BOTH the

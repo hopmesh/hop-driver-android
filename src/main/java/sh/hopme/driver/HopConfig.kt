@@ -15,7 +15,7 @@ data class HopConfig(
     val appSecret: ByteArray,
     val deviceName: String,
     val relayUrl: String = HopBearer.DEFAULT_RELAY,
-    /** When false the bearer never dials the backbone relay — pure P2P (BLE/LAN/Wi-Fi Direct) only.
+    /** When false the bearer never dials the backbone relay - pure P2P (BLE/LAN/Wi-Fi Direct) only.
      *  android-09: defaults FALSE to match the deployed-off fleet (relays_enabled=false in infra), so a
      *  bare-service restart never wakes the radio every ~31s to dial a dead endpoint. A caller that
      *  wants the relay must opt in explicitly, and [HopBearer] still ANDs this with a runtime killswitch
@@ -50,7 +50,7 @@ data class HopConfig(
         /// Pure resolution rule for the relay flag (android-r2-02), split out so the "both init paths
         /// agree" invariant is unit-testable without a Context: use the persisted choice when present,
         /// else the fallback. Because BOTH paths feed the SAME persisted value in, they agree by
-        /// construction — the historical bug was two different hardcoded literals, not this rule.
+        /// construction - the historical bug was two different hardcoded literals, not this rule.
         fun resolveRelaysEnabled(stored: Boolean?, fallback: Boolean): Boolean = stored ?: fallback
 
         /// android-r2-02: persist the app's relay choice so BOTH init paths pick it up. Call this before
@@ -74,8 +74,8 @@ data class HopConfig(
             dbKey = HopBearer.dbKey(context),
         )
 
-        /// Prefer the user-assigned device name (e.g. "Jason's Pixel") — gettable on Android via
-        /// Settings.Global.DEVICE_NAME — over the generic marketing model (Build.MODEL).
+        /// Prefer the user-assigned device name (e.g. "Jason's Pixel") - gettable on Android via
+        /// Settings.Global.DEVICE_NAME - over the generic marketing model (Build.MODEL).
         fun deviceName(context: Context): String {
             val userName = runCatching {
                 android.provider.Settings.Global.getString(

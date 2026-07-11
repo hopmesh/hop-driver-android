@@ -10,14 +10,14 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <!-- Fine location: needed only for BLE scan on API ≤30 (neverForLocation on 31+ via BLUETOOTH_SCAN).
-         F-37: capped at 30 now that Wi-Fi Direct is gone — it was the only thing needing 31-32. -->
+         F-37: capped at 30 now that Wi-Fi Direct is gone - it was the only thing needing 31-32. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
 
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <!-- LAN bearer (mDNS/NSD + TCP): discover and link nearby devices over a shared Wi-Fi network.
          F-37: Wi-Fi Direct was removed (commit c059d69), so its CHANGE_WIFI_STATE / NEARBY_WIFI_DEVICES
-         permissions and the wifi.direct feature are dropped — NSD needs only these. -->
+         permissions and the wifi.direct feature are dropped - NSD needs only these. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />

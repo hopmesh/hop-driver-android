@@ -33,7 +33,7 @@ internal object MirrorCrypto {
 
     /**
      * Seal [plaintext] under [key] (a 32-byte AES key). Returns MAGIC|VER|IV|GCM-ciphertext. If [key]
-     * is empty (a plain, non-SQLCipher dev build — no at-rest key exists), returns [plaintext] as-is so
+     * is empty (a plain, non-SQLCipher dev build - no at-rest key exists), returns [plaintext] as-is so
      * behavior matches the unencrypted db case; there is nothing to protect the mirror WITH.
      */
     fun seal(key: ByteArray, plaintext: ByteArray): ByteArray {

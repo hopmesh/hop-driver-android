@@ -5,7 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * quality-cov: [HopBearer.validateRelayUrl] — the gate that keeps junk out of the persisted pinned
+ * quality-cov: [HopBearer.validateRelayUrl] - the gate that keeps junk out of the persisted pinned
  * relay. The shared RelayBearer dials the pinned value over an OkHttp WebSocket, which accepts only
  * ws/wss/https/http with a non-empty host; a bad string that latched into prefs would be a silent
  * relay outage (the device talks to exactly one relay). These pin: the four accepted schemes, the
@@ -47,7 +47,7 @@ class RelayUrlTest {
 
     @Test fun rejectsAnEmptyHost() {
         assertNull("scheme with no host", HopBearer.validateRelayUrl("wss://"))
-        assertNull("scheme then slash — empty host", HopBearer.validateRelayUrl("wss:///path"))
+        assertNull("scheme then slash - empty host", HopBearer.validateRelayUrl("wss:///path"))
         assertNull("host is only a port", HopBearer.validateRelayUrl("wss://:9443"))
     }
 

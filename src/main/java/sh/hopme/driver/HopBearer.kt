@@ -1,28 +1,16 @@
 package sh.hopme.driver
 
 import android.annotation.SuppressLint
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.content.Context
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
-import java.io.File
 import kotlin.concurrent.thread
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
 import androidx.compose.runtime.mutableStateMapOf
-import androidx.compose.runtime.snapshots.SnapshotStateList
 import uniffi.hop.HopNode
 import uniffi.hop.HopNodeInterface
-import uniffi.hop.HnsLookupResult
-import uniffi.hop.HpsKind
 import uniffi.hop.TraceHopInfo
 import uniffi.hop.addressBase58
 import uniffi.hop.addressFromBase58
@@ -66,7 +54,7 @@ class HopBearer internal constructor(
         val failed: Boolean = false,   // gave up (e.g. the queue was cleared before it sent)
     )
 
-    // Identity derived from the device (stable, storage-independent — §4); the db path
+    // Identity derived from the device (stable, storage-independent - §4); the db path
     // persists messages across restarts. Both come from the host-supplied HopConfig.
     // F-25: open SQLCipher-encrypted with the device-derived db key (empty ⇒ plain). Only encrypts
     // when libhop is built `--features sqlcipher` (android/build-aar.sh, on by default).
@@ -88,7 +76,7 @@ class HopBearer internal constructor(
     private constructor(context: Context, config: HopConfig) : this(context, config, null)
     val peers = mutableStateListOf<Peer>()
     /// Persistent address book: everyone we've seen, messaged, or been messaged by, keyed by address.
-    /// `seen` is the subset NOT currently reachable — so past conversations stay reachable even when
+    /// `seen` is the subset NOT currently reachable - so past conversations stay reachable even when
     /// the peer is offline / out of range / after a restart (mirrors iOS).
     private val contacts = HashMap<List<Byte>, Peer>()
     val seen = mutableStateListOf<Peer>()
@@ -96,37 +84,23 @@ class HopBearer internal constructor(
     /// (reached multi-hop) have no entry. Mirrors iOS's link-type indicators.
     val linkTransports = mutableStateMapOf<List<Byte>, String>()
     val messages = mutableStateListOf<Message>()
-    /// Unread incoming messages received while backgrounded — mirrored onto the app icon
+    /// Unread incoming messages received while backgrounded - mirrored onto the app icon
     /// badge (via the notification) and cleared when the app returns to the foreground.
     val unread = androidx.compose.runtime.mutableIntStateOf(0)
     val secured = mutableStateListOf<List<Byte>>()   // addresses with a forward-secret session
 
-    // hops:// (DESIGN.md §30): domain → rendered result; pending resolves + outstanding requests.
-    val hopsResults = mutableStateMapOf<String, String>()
-    private val pendingHops = HashMap<String, String>()              // domain → path awaiting resolve
-    private val hopsReqs = HashMap<List<Byte>, String>()             // request id → domain
-    // DoH client for DNSSEC-chain fetches (§30). BOUNDED concurrency: fetchDnssecChain enqueues one GET
-    // per zone/record, so a burst of resolves (a page that references many hops:// domains, or a flood of
-    // takeDnsLookups) could otherwise spawn an unbounded number of in-flight HTTPS requests and exhaust
-    // sockets/threads. Cap the dispatcher so excess calls queue instead of all firing at once.
-    private val dohClient = OkHttpClient.Builder()
-        .dispatcher(okhttp3.Dispatcher().apply {
-            maxRequests = DOH_MAX_CONCURRENT              // total in-flight GETs across all domains
-            maxRequestsPerHost = DOH_MAX_CONCURRENT       // all go to one host (dns.google), so cap it too
-        })
-        .build()
-    // HNS cache debug view: domain → (address, ttl).
-    val hnsCache = mutableStateListOf<HnsCacheRow>()
+    // HNS + hops:// (DESIGN.md §30) is owned by [HnsController] (composed below, once core/nameByAddr
+    // exist). The app-facing state (hopsResults, hnsCache) is re-exposed as delegating getters so
+    // `bearer.hopsResults` / `bearer.hnsCache` keep returning the same Compose snapshot instances.
+    /// One HNS cache debug row: domain → (address, ttl). App-facing model, kept nested here.
     data class HnsCacheRow(val domain: String, val address: ByteArray, val ttlSecs: UInt)
 
-    // hps:// pub/sub (DESIGN.md §32): topics we host/subscribe, per-topic threads, unread, invites.
-    val hpsTopics = mutableStateListOf<HpsTopic>()
-    val hpsThreads = mutableStateMapOf<String, SnapshotStateList<HpsMsg>>() // topic id → messages
-    val hpsUnread = mutableStateMapOf<String, Int>()                        // topic id → unread
-    val hpsInvites = mutableStateListOf<uniffi.hop.HpsInvite>()         // invites received
-    @Volatile var activeTopic: String? = null                              // topic on screen
+    // hps:// pub/sub (DESIGN.md §32) is owned by [HpsController] (composed below, once core/mirror exist).
+    // The app-facing state (hpsTopics/hpsThreads/hpsUnread/hpsInvites) is re-exposed as delegating getters
+    // so `bearer.hps*` keeps returning the same Compose snapshot instances. HpsTopic/HpsMsg stay nested
+    // here (the app references them as HopBearer.HpsTopic / HopBearer.HpsMsg).
 
-    // Diagnostics (Status tab) — parity with iOS: service-call log + relay queue.
+    // Diagnostics (Status tab) - parity with iOS: service-call log + relay queue.
     val serviceLog = mutableStateListOf<String>()
     val queue = mutableStateListOf<QueueRow>()
     data class QueueRow(val own: Boolean, val to: String, val priority: UByte, val hops: UByte)
@@ -155,24 +129,26 @@ class HopBearer internal constructor(
     var relayStatus = mutableStateOf("not connected")
     private val prefs get() = context.getSharedPreferences("hop", android.content.Context.MODE_PRIVATE)
     /// A relay the user pinned by direct address (persisted). A device only ever talks to ONE
-    /// relay — routing is anycast — so pinning overrides the anycast default for testing a
+    /// relay - routing is anycast - so pinning overrides the anycast default for testing a
     /// specific relay, rather than publishing presence to several at once.
     val pinnedRelay = mutableStateOf<String?>(null)
     private val nextMsgId = java.util.concurrent.atomic.AtomicLong(0L)
-    /// android-r2-06: monotonic notification id so two messages with identical text (same or different
-    /// sender) don't collide on text.hashCode() and silently replace each other. Starts high to avoid
-    /// colliding with the foreground-service's fixed ONGOING_ID (1).
-    private val nextNotifId = java.util.concurrent.atomic.AtomicInteger(1000)
+    /// Notifications concern (message channel + incoming-message notification + badge). Split out of the
+    /// god-object into [Notifier]; the driver composes it and posts from pump().
+    private val notifier = Notifier(context, CHANNEL_ID, config.notificationIcon)
+    /// At-rest mirror store (seal/open + content-addressed media) the three persistence mirrors share.
+    /// Split out of the god-object into [MirrorStore]; wraps [MirrorCrypto] with the device db key.
+    private val mirror = MirrorStore(config.dbKey, context.filesDir)
     @Volatile private var appActive = true
     private val appName: String =
         context.applicationInfo.loadLabel(context.packageManager).toString()
 
     // Threading model (DESIGN: Stage C). Every node.* call and all bearer plumbing run on ONE serial
-    // background thread (hop.core), so the main thread never does node/SQLite/crypto work — under
+    // background thread (hop.core), so the main thread never does node/SQLite/crypto work - under
     // multi-peer BLE load that path ANR'd ("Skipped N frames"). The node is internally Mutex-guarded
     // (thread-safe), so the rare synchronous UI getters (node.address(), hpsReach/Members/…) can still
     // read it directly from main. Compose snapshot state is UI state: it is WRITTEN ONLY on the main
-    // thread via onUi { } — core does the node work, then marshals the visible result to main. The
+    // thread via onUi { } - core does the node work, then marshals the visible result to main. The
     // heavy SQLite-backed refresh stays coalesced (~4 Hz, scheduleRefresh); never refresh per-frame.
     private val coreThread = HandlerThread("hop.core").apply { start() }
     private val core = Handler(coreThread.looper)
@@ -186,13 +162,35 @@ class HopBearer internal constructor(
     // Read from the UI thread (displayName) and written on core (refresh/pump), so concurrent-safe.
     private val nameByAddr = java.util.concurrent.ConcurrentHashMap<List<Byte>, String>()
 
+    // HNS + hops:// concern (§30), composed here now that node/core/nameByAddr exist. Every method runs
+    // on `core`; drainHns() is still called from pump(), expireHopsWeb() from the tick loop, and the DoH
+    // client is released in teardown() via hns.shutdown().
+    private val hns = HnsController(node, core, ::onUi, ::pump, nameByAddr, config.dohResolverUrl, DOH_MAX_CONCURRENT)
+    /// hops:// text-box results (domain → rendered result). Delegates to [HnsController] so the app keeps
+    /// observing the same Compose snapshot map (`bearer.hopsResults`).
+    val hopsResults get() = hns.hopsResults
+    /// HNS cache debug view. Delegates to [HnsController] (`bearer.hnsCache`).
+    val hnsCache get() = hns.hnsCache
+
+    // hps:// pub/sub concern (§32), composed here now that node/core/mirror exist. drainHps() is called
+    // from pump(); loadChannels()/loadTopics() from start(). The app-facing state is re-exposed below.
+    private val hps = HpsController(node, core, ::onUi, ::pump, { nextMsgId.getAndIncrement() }, mirror, context.filesDir)
+    /// Topics we host/subscribe. Delegates to [HpsController] (`bearer.hpsTopics`).
+    val hpsTopics get() = hps.hpsTopics
+    /// Per-topic message threads (topic id → messages). Delegates to [HpsController] (`bearer.hpsThreads`).
+    val hpsThreads get() = hps.hpsThreads
+    /// Per-topic unread counts. Delegates to [HpsController] (`bearer.hpsUnread`).
+    val hpsUnread get() = hps.hpsUnread
+    /// Received channel invites. Delegates to [HpsController] (`bearer.hpsInvites`).
+    val hpsInvites get() = hps.hpsInvites
+
     // ---- shared cross-platform transport layer (ble-lab bearer-core/-ble/-lan/-relay) ----
     // The driver forms pure-L2CAP BLE + LAN + cloud-relay links, all multiplexed by ONE BearerManager
     // and surfaced through bearerSink into the node seam. The manager's global link-id space starts
     // HIGH (1_000_000). (The legacy in-driver BLE/LAN/relay transports and Wi-Fi Direct were removed.)
     private val bearerMgr = sh.hop.BearerManager(baseLinkId = 1_000_000L)
     // One transport id shared by the bearers (the BLE/LAN HELLO id + greater-id dedup tiebreaker);
-    // distinct from the Hop node address — Noise is still negotiated over the bearer's DATA frames.
+    // distinct from the Hop node address - Noise is still negotiated over the bearer's DATA frames.
     private val bearerId = sh.hop.randomNodeId()
     // Link ids currently owned by the BearerManager, so refresh() can tag them by transport. CORE-CONFINED:
     // added/removed and read ONLY inside core.post (pump() also runs on core), so it needs no lock.
@@ -204,8 +202,8 @@ class HopBearer internal constructor(
     private val linkFlow = LinkFlow()
     // Adapts the shared BearerManager to the node seam. Every link from a bearer surfaces here and
     // drives node.connected/received/disconnected (linkId mismatch: the bearer libs use Long, the node
-    // uses ULong — convert at this boundary).
-    // android-09: the effective relay switch — the caller's config AND'd with a runtime killswitch pref,
+    // uses ULong - convert at this boundary).
+    // android-09: the effective relay switch - the caller's config AND'd with a runtime killswitch pref,
     // so the deployed-off fleet stays off without an app update. Set once in start().
     @Volatile private var relaysOnVal = false
     /// android-09: relays run only when the caller opted in AND the runtime killswitch is on. The pref
@@ -220,13 +218,13 @@ class HopBearer internal constructor(
     private val relayLinks = java.util.Collections.synchronizedSet(HashSet<Long>())
     private val bearerSink = object : sh.hop.LinkSink {
         override fun linkUp(link: Long, role: sh.hop.HopRole, peerId: ByteArray) {
-            // android-03: LINKFLOW at the manager seam — the GLOBAL link id + transport + peer, so a soak
+            // android-03: LINKFLOW at the manager seam - the GLOBAL link id + transport + peer, so a soak
             // can correlate a bearer-local "LINKFLOW LINK UP link=<local>" line with the node-facing
             // connected()/disconnected() churn. This is where the previously-missing bearer↔global↔node
             // link correlation gets stitched.
             val t = bearerMgr.transportNameOf(link) ?: "?"
             android.util.Log.i("HOPLOG", "LINKFLOW SEAM UP g=$link xport=$t role=$role peer=${peerId.take(6).joinToString("") { "%02x".format(it) }}")
-            // android-11: infer relay status from the manager's link events — the RelayBearer surfaces its
+            // android-11: infer relay status from the manager's link events - the RelayBearer surfaces its
             // one link with transportName "Relay", so a live relay link IS the honest "connected" signal.
             if (t == "Relay") {
                 relayLinks.add(link)
@@ -268,11 +266,11 @@ class HopBearer internal constructor(
     fun start(name: String = config.deviceName) = core.post {
         if (started) return@post
         started = true
-        ensureNotificationChannel()
+        notifier.ensureChannel()
         loadMessages()      // restore chat history from the previous run
         loadContacts()      // restore the address book so past conversations are reachable when offline
-        loadHpsChannels()   // restore channel (hps) message threads
-        loadHpsTopics()     // restore hosted/subscribed channels (the node persists them)
+        hps.loadChannels()  // restore channel (hps) message threads
+        hps.loadTopics()    // restore hosted/subscribed channels (the node persists them)
         myNameVal = name; onUi { myName.value = name }
         val addr58 = addressBase58(node.address())
         myAddressVal = addr58; onUi { myAddress.value = addr58 }
@@ -303,7 +301,7 @@ class HopBearer internal constructor(
         bearerMgr.sink = bearerSink
         bearerMgr.register(sh.hopme.bearers.ble.BleBearer(context, bearerId))
         bearerMgr.register(sh.hopme.bearers.lan.LanBearer(context, bearerId))
-        // Cloud relay (WebSocket) as a shared bearer — ONE outbound link to the backbone, registered
+        // Cloud relay (WebSocket) as a shared bearer - ONE outbound link to the backbone, registered
         // only when relays are enabled and a URL exists. (P2P test mode sets relaysEnabled=false, so
         // this stays unregistered.)
         val relaysOn = relaysEffectivelyEnabled()
@@ -351,7 +349,7 @@ class HopBearer internal constructor(
                 // (or who arrived later) can always open a forward-secret session to us (§25).
                 if (ticks % 120 == 0) runCatching { node.publishPrekey() }
                 if (ticks % 15 == 0 && DriverFlags.verboseContentLogs) android.util.Log.i("HOPLOG", "HOPAUTO self=$myAddressVal name=${config.deviceName}")  // periodic, so the harness always finds it (android-r2-05: debug only)
-                expireHopsWeb()   // android-13: fail out WebView fetches whose resolve/response never arrived
+                hns.expireHopsWeb()   // android-13: fail out WebView fetches whose resolve/response never arrived
                 pump()
                 // DIAG: node link state each tick. peerLinks() maps each Up link to its peer address,
                 // so a link that is UP but stuck (no peerLinks) shows the Noise handshake never
@@ -395,8 +393,7 @@ class HopBearer internal constructor(
         // Stop the radios/sockets first so no new link event races the node close.
         runCatching { bearerMgr.stop() }
         // Release the DoH client's dispatcher thread pool + connection pool (bounded, but still held).
-        runCatching { dohClient.dispatcher.executorService.shutdown() }
-        runCatching { dohClient.connectionPool.evictAll() }
+        hns.shutdown()
         // Drain the core queue THEN close the node + quit the thread, so any already-queued node work
         // finishes before the handle is freed (closing under an in-flight node.* call is a use-after-free).
         core.post {
@@ -442,12 +439,12 @@ class HopBearer internal constructor(
         sh.hop.appInBackground = !fg   // shared bearers: relax liveness deadline when backgrounded
         if (fg) {   // the user is looking at the app → clear the unread badge + notifications
             unread.intValue = 0
-            runCatching { NotificationManagerCompat.from(context).cancelAll() }
+            notifier.cancelAll()
         }
         core.post { publishPresence(); pump() }
     }
 
-    /** Stable conversation key for a peer — its base58 ADDRESS, never its display name. Two distinct
+    /** Stable conversation key for a peer - its base58 ADDRESS, never its display name. Two distinct
      *  peers that happen to share a name (e.g. two "Pixel 7"s) must not collapse into one thread. */
     fun keyFor(p: Peer): String = addressBase58(p.address)
 
@@ -455,7 +452,7 @@ class HopBearer internal constructor(
      *  needed). Backs the hopdemo://send deep link so a harness can drive sends without UI taps.
      *
      *  android-r2-03: this is a silent send-as-user primitive, so it is inert unless the automation
-     *  surface is enabled (debug builds only) — defense in depth beside the debug-only manifest filter
+     *  surface is enabled (debug builds only) - defense in depth beside the debug-only manifest filter
      *  and the BuildConfig.DEBUG guard in the activity. */
     fun sendTo(addrBase58: String, text: String) {
         if (!DriverFlags.automationSurface) return   // release: refuse driven sends (android-r2-03)
@@ -467,7 +464,7 @@ class HopBearer internal constructor(
         // Optimistic insert: the bubble appears INSTANTLY (next main frame), decoupled from the serial
         // core thread + the blocking node.sendMessage. The node send + the bundleId (for delivery
         // tracking) fill in on core and patch back by localId. (Prior bug: the append ran INSIDE
-        // core.post AFTER node.sendMessage, so a busy core stalled the bubble for seconds — felt frozen.)
+        // core.post AFTER node.sendMessage, so a busy core stalled the bubble for seconds - felt frozen.)
         val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(to.address), text = text, incoming = false, bundleId = null)
         onUi { messages.add(msg) }
         core.post {
@@ -482,7 +479,7 @@ class HopBearer internal constructor(
     /// Patch an optimistically-inserted outgoing message with the bundleId returned by node.sendMessage.
     /// Located by localId; the StateList edit hops to main. A non-null id → track delivery. A NULL id
     /// means node.sendMessage THREW (a real store/seal error, not the peer-unreachable case, which
-    /// defers with a valid id) — mark the row `failed` so it stops showing "Sending…" forever and the
+    /// defers with a valid id) - mark the row `failed` so it stops showing "Sending…" forever and the
     /// "Not sent · tap to retry" affordance engages (F-15). Applies to text/image/multipart alike.
     private fun stampSent(localId: Long, id: ByteArray?) = onUi {
         val i = messages.indexOfFirst { it.localId == localId }
@@ -490,12 +487,12 @@ class HopBearer internal constructor(
         messages[i] = if (id != null) messages[i].copy(bundleId = id) else messages[i].copy(failed = true)
     }
 
-    /// Send an image — large bodies are transparently carrier-chunked + reassembled by core
+    /// Send an image - large bodies are transparently carrier-chunked + reassembled by core
     /// (DESIGN.md §20), same path as a text message but a binary content type.
     fun sendImage(data: ByteArray, to: Peer) {
         val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(to.address), text = "", incoming = false,
             bundleId = null, contentType = "image/jpeg", imageData = data)
-        onUi { messages.add(msg) }   // optimistic — instant bubble (see send())
+        onUi { messages.add(msg) }   // optimistic - instant bubble (see send())
         core.post {
             rememberContact(to)
             val id = runCatching { node.sendMessage(to.address, "image/jpeg", data, true) }.getOrNull()
@@ -504,7 +501,7 @@ class HopBearer internal constructor(
         }
     }
 
-    /// Send text and/or one-or-more images as ONE message (multipart/mixed) — a single sealed
+    /// Send text and/or one-or-more images as ONE message (multipart/mixed) - a single sealed
     /// payload (DESIGN.md §20/§32). Wire format shared with iOS:
     /// `[u32 partCount][ per part: u16 ctLen, ct, u32 bodyLen, body ]`.
     fun sendMultipart(text: String, images: List<ByteArray>, to: Peer) {
@@ -515,7 +512,7 @@ class HopBearer internal constructor(
         if (parts.isEmpty()) return
         val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(to.address), text = t, incoming = false,
             bundleId = null, contentType = "multipart/mixed", images = images)
-        onUi { messages.add(msg) }   // optimistic — instant bubble (see send())
+        onUi { messages.add(msg) }   // optimistic - instant bubble (see send())
         core.post {
             rememberContact(to)
             val id = runCatching { node.sendMessage(to.address, "multipart/mixed", encodeMultipart(parts), true) }.getOrNull()
@@ -594,12 +591,12 @@ class HopBearer internal constructor(
             val notifyText = if (isImage) "Photo" else text  // system notifications can't render FA glyphs
             onUi {   // UI-visible result → main thread
                 messages.add(msg)
-                if (!appInForeground) { unread.intValue += 1; notify(who, notifyText) }
+                if (!appInForeground) { unread.intValue += 1; notifier.notify(who, notifyText, unread.intValue) }
             }
         }
         saveMessages()
-        drainHps()       // pub/sub messages (§32)
-        drainHns()       // HNS lookups + hops:// responses (§30)
+        hps.drainHps()   // pub/sub messages (§32)
+        hns.drainHns()   // HNS lookups + hops:// responses (§30)
         drainServices()  // hop.identify replies + custom service calls (§29)
         // (relay-queue diagnostics now refresh on the coalesced scheduleRefresh path, not per-frame)
     }
@@ -633,7 +630,7 @@ class HopBearer internal constructor(
                 logLines.add("identify ← $label (${info.kind})")
                 scheduleRefresh()
             } else {
-                // Service-response bodies are usually binary (postcard) — a lenient String(bytes)
+                // Service-response bodies are usually binary (postcard) - a lenient String(bytes)
                 // mojibakes them. Match iOS: strict UTF-8 decode, else show a byte count.
                 val text = runCatching {
                     Charsets.UTF_8.newDecoder()
@@ -645,7 +642,7 @@ class HopBearer internal constructor(
             }
         }
         for (req in node.takeServiceRequests()) {
-            // No custom services in the demo — reply 501 so the caller isn't left hanging.
+            // No custom services in the demo - reply 501 so the caller isn't left hanging.
             logLines.add("service → ${req.service}/${req.method} (501)")
             runCatching { node.sendServiceResponse(req.from, req.requestId, 501u, ByteArray(0)) }
         }
@@ -665,7 +662,7 @@ class HopBearer internal constructor(
 
     fun clearQueue() = core.post {
         runCatching { node.clearQueue() }
-        // Anything of ours still in flight is now abandoned — mark those "not sent" instead of
+        // Anything of ours still in flight is now abandoned - mark those "not sent" instead of
         // leaving them stuck on "Sending…".
         onUi {
             for (i in messages.indices) {
@@ -678,316 +675,43 @@ class HopBearer internal constructor(
     }
 
     // ---- hps:// pub/sub (DESIGN.md §32) -------------------------------------
+    // The concern lives in [HpsController]; HopBearer keeps the public entry points the app calls and
+    // delegates to it (drainHps/loadChannels/loadTopics are wired at the pump/start sites above).
 
     fun hpsRegister(path: String, channel: Boolean,
                     access: uniffi.hop.HpsAccess = uniffi.hop.HpsAccess.OPEN,
-                    discoverable: Boolean = false) = core.post {
-        val p = path.trim(); if (p.isEmpty()) return@post
-        runCatching {
-            node.registerService(p, if (channel) HpsKind.CHANNEL else HpsKind.SERVICE, access,
-                if (discoverable) uniffi.hop.HpsVisibility.DISCOVERABLE else uniffi.hop.HpsVisibility.PRIVATE)
-        }
-        val topic = HpsTopic(node.address(), p, channel, hosting = true, access = access)
-        onUi { if (hpsTopics.none { it.host.contentEquals(topic.host) && it.path == p }) hpsTopics.add(0, topic) }
-    }
-
-    fun hpsSubscribe(hostB58: String, path: String) = core.post {
-        val host = runCatching { addressFromBase58(hostB58.trim()) }.getOrNull() ?: return@post
-        val p = path.trim(); if (host.size != 32 || p.isEmpty()) return@post
-        hpsSubscribeTo(host, p, channel = true)
-    }
-
-    private fun hpsSubscribeTo(host: ByteArray, path: String, channel: Boolean) {
-        runCatching { node.hpsSubscribe(host, path) }
-        val topic = HpsTopic(host, path, channel = channel, hosting = false)
-        onUi { if (hpsTopics.none { it.host.contentEquals(host) && it.path == path }) hpsTopics.add(0, topic) }
-        pump()
-    }
-
-    fun hpsJoin(t: uniffi.hop.HpsTopicInfo) = core.post {
-        hpsSubscribeTo(t.host, t.path, t.kind == HpsKind.CHANNEL)
-    }
-
-    fun hpsPublish(topic: HpsTopic, text: String) = core.post {
-        if (text.isEmpty()) return@post
-        runCatching { node.hpsPublish(topic.path, text.toByteArray()) }
-        appendThread(topic.id, HpsMsg(nextMsgId.getAndIncrement(), topic.path, node.address(), text)) // echo
-        pump()
-    }
-
-    fun hpsInvite(topic: HpsTopic, to: ByteArray) = core.post {
-        if (!topic.hosting || to.size != 32) return@post
-        runCatching { node.hpsInvite(topic.path, to) }; pump()
-    }
-
-    fun hpsAcceptInvite(inv: uniffi.hop.HpsInvite) = core.post {
-        runCatching { node.hpsAcceptInvite(inv.host, inv.path) }
-        val topic = HpsTopic(inv.host, inv.path, inv.kind == HpsKind.CHANNEL, hosting = false)
-        onUi {
-            hpsInvites.removeAll { it.path == inv.path && it.host.contentEquals(inv.host) }
-            if (hpsTopics.none { it.host.contentEquals(inv.host) && it.path == inv.path }) hpsTopics.add(0, topic)
-        }
-        pump()
-    }
-
-    fun hpsDeclineInvite(inv: uniffi.hop.HpsInvite) = core.post {
-        runCatching { node.hpsDeclineInvite(inv.host, inv.path) } // durable: won't reappear
-        onUi { hpsInvites.removeAll { it.path == inv.path && it.host.contentEquals(inv.host) } }
-    }
-
-    fun hpsPending(topic: HpsTopic): List<ByteArray> = runCatching { node.hpsPending(topic.path) }.getOrDefault(emptyList())
-    fun hpsApprove(topic: HpsTopic, who: ByteArray) = core.post { runCatching { node.hpsApprove(topic.path, who) }; pump() }
-    fun hpsDeny(topic: HpsTopic, who: ByteArray) = core.post { runCatching { node.hpsDeny(topic.path, who) } }
-    fun hpsReach(topic: HpsTopic): Int = runCatching { node.hpsReach(topic.path).toInt() }.getOrDefault(0)
-    fun hpsMembers(topic: HpsTopic): List<ByteArray> = runCatching { node.hpsMembers(topic.path) }.getOrDefault(emptyList())
-    fun hpsRekey(topic: HpsTopic, remove: List<ByteArray> = emptyList()) = core.post { runCatching { node.hpsRekey(topic.path, "", remove) }; pump() }
-    fun hpsBrowse(): List<uniffi.hop.HpsTopicInfo> = runCatching { node.browseDiscoverable() }.getOrDefault(emptyList())
-
-    /// Rebuild the channel list from the node's persisted topics (hosted + subscribed) at startup.
-    private fun loadHpsTopics() {
-        val topics = runCatching { node.hpsMyTopics() }.getOrDefault(emptyList()).map { t ->
-            HpsTopic(t.host, t.path, t.kind == HpsKind.CHANNEL, t.hosting, t.access)
-        }
-        onUi { topics.forEach { topic -> if (hpsTopics.none { it.id == topic.id }) hpsTopics.add(topic) } }
-    }
-
-    fun hpsLeave(topic: HpsTopic) = core.post {
-        runCatching { node.hpsLeave(topic.path) }
-        onUi {
-            hpsTopics.removeAll { it.id == topic.id }
-            hpsThreads.remove(topic.id); hpsUnread.remove(topic.id)
-        }
-        pump()
-    }
-
-    fun openTopic(id: String) { activeTopic = id; hpsUnread[id] = 0 }
-    fun closeTopic() { activeTopic = null }
+                    discoverable: Boolean = false) = hps.hpsRegister(path, channel, access, discoverable)
+    fun hpsSubscribe(hostB58: String, path: String) = hps.hpsSubscribe(hostB58, path)
+    fun hpsJoin(t: uniffi.hop.HpsTopicInfo) = hps.hpsJoin(t)
+    fun hpsPublish(topic: HpsTopic, text: String) = hps.hpsPublish(topic, text)
+    fun hpsInvite(topic: HpsTopic, to: ByteArray) = hps.hpsInvite(topic, to)
+    fun hpsAcceptInvite(inv: uniffi.hop.HpsInvite) = hps.hpsAcceptInvite(inv)
+    fun hpsDeclineInvite(inv: uniffi.hop.HpsInvite) = hps.hpsDeclineInvite(inv)
+    fun hpsPending(topic: HpsTopic): List<ByteArray> = hps.hpsPending(topic)
+    fun hpsApprove(topic: HpsTopic, who: ByteArray) = hps.hpsApprove(topic, who)
+    fun hpsDeny(topic: HpsTopic, who: ByteArray) = hps.hpsDeny(topic, who)
+    fun hpsReach(topic: HpsTopic): Int = hps.hpsReach(topic)
+    fun hpsMembers(topic: HpsTopic): List<ByteArray> = hps.hpsMembers(topic)
+    fun hpsRekey(topic: HpsTopic, remove: List<ByteArray> = emptyList()) = hps.hpsRekey(topic, remove)
+    fun hpsBrowse(): List<uniffi.hop.HpsTopicInfo> = hps.hpsBrowse()
+    fun hpsLeave(topic: HpsTopic) = hps.hpsLeave(topic)
+    fun openTopic(id: String) = hps.openTopic(id)
+    fun closeTopic() = hps.closeTopic()
 
     /// Resolved display name for an address (its set name, or a short base58 prefix).
     fun displayName(addr: ByteArray): String = nameByAddr[addr.toList()] ?: shortHex(addr)
     /// Known peers as an invite-picker list (sorted by name).
     val contactList: List<Peer> get() = peers.sortedBy { it.name.lowercase() }
 
-    private fun appendThread(id: String, m: HpsMsg) {
-        onUi {
-            val list = hpsThreads.getOrPut(id) { mutableStateListOf() }
-            list.add(m)
-            if (list.size > 500) list.removeAt(0)
-        }
-        saveChannels()
-    }
-
-    // ---- channel-thread persistence (survives restart) ----------------------
-    private val channelsFile get() = java.io.File(context.filesDir, "channels.json")
-    private var channelSaveScheduled = false
-    private fun saveChannels() {
-        if (channelSaveScheduled) return
-        channelSaveScheduled = true
-        core.postDelayed({ channelSaveScheduled = false; writeChannels() }, 1000)
-    }
-    private fun writeChannels() {
-        val root = org.json.JSONObject()
-        for ((id, msgs) in hpsThreads) {
-            val arr = org.json.JSONArray()
-            for (m in msgs) {
-                arr.put(org.json.JSONObject().apply {
-                    put("path", m.path)
-                    put("sender", android.util.Base64.encodeToString(m.sender, android.util.Base64.NO_WRAP))
-                    put("text", m.text)
-                })
-            }
-            root.put(id, arr)
-        }
-        // android-r2-01: seal the channel mirror with the Keystore-wrapped db key so it is not
-        // plaintext beside the encrypted hop.db (empty key ⇒ plain, matching an unencrypted db).
-        runCatching { channelsFile.writeBytes(MirrorCrypto.seal(config.dbKey, root.toString().toByteArray())) }
-    }
-    private fun loadHpsChannels() {
-        val txt = readMirror(channelsFile) ?: return
-        val root = runCatching { org.json.JSONObject(txt) }.getOrNull() ?: return
-        val loaded = LinkedHashMap<String, List<HpsMsg>>()
-        for (id in root.keys()) {
-            val arr = root.optJSONArray(id) ?: continue
-            val msgs = ArrayList<HpsMsg>()
-            for (i in 0 until arr.length()) {
-                val o = arr.getJSONObject(i)
-                msgs.add(HpsMsg(nextMsgId.getAndIncrement(), o.optString("path", ""),
-                    android.util.Base64.decode(o.optString("sender", ""), android.util.Base64.NO_WRAP),
-                    o.optString("text", "")))
-            }
-            loaded[id] = msgs
-        }
-        onUi { for ((id, msgs) in loaded) hpsThreads[id] = mutableStateListOf<HpsMsg>().apply { addAll(msgs) } }
-    }
-
-    private fun drainHps() {
-        for (m in node.takeHpsMessages()) {
-            val topic = hpsTopics.firstOrNull { it.path == m.path }
-            val id = topic?.id ?: m.path
-            appendThread(id, HpsMsg(nextMsgId.getAndIncrement(), m.path, m.sender, String(m.body)))
-            onUi { if (id != activeTopic) hpsUnread[id] = (hpsUnread[id] ?: 0) + 1 }
-        }
-        for (inv in node.takeHpsInvites()) {
-            onUi {
-                if (hpsInvites.none { it.path == inv.path && it.host.contentEquals(inv.host) })
-                    hpsInvites.add(inv)
-            }
-        }
-    }
-
     // ---- HNS & hops:// (DESIGN.md §30) -------------------------------------
+    // The concern lives in [HnsController]; HopBearer keeps the public entry points the app calls and
+    // delegates to it (drainHns/expireHopsWeb/shutdown are wired at the pump/tick/teardown sites above).
 
     /// Open `hops://<domain>/<path>` (bare `<domain>` ok): resolve via HNS, then GET over the mesh.
-    fun openHops(input: String) = core.post {
-        val (domain, path) = parseHops(input)
-        if (domain.isEmpty()) { onUi { hopsResults["?"] = "error: not a hops:// url" }; return@post }
-        onUi { hopsResults[domain] = "resolving…" }
-        when (val r = node.resolveHns(domain)) {
-            is HnsLookupResult.Cached ->
-                if (r.address.isEmpty()) onUi { hopsResults[domain] = "error: no hops endpoint for $domain" }
-                else fireHops(domain, path, r.address)
-            is HnsLookupResult.Pending -> pendingHops[domain] = path
-            is HnsLookupResult.NeedsResolver ->
-                onUi { hopsResults[domain] = "error: offline — no internet or peers to resolve $domain" }
-        }
-        pump()
-    }
-
-    private fun fireHops(domain: String, path: String, endpoint: ByteArray) {
-        nameByAddr[endpoint.toList()] = domain // label the endpoint by its domain (endpoints list/traces)
-        val id = runCatching {
-            node.sendHopsRequest(endpoint, domain, "GET", path, ByteArray(0), 8u * 1024u * 1024u)
-        }.getOrNull()
-        if (id == null) { onUi { hopsResults[domain] = "error: could not send request to $domain" }; return }
-        hopsReqs[id.toList()] = domain
-        onUi { hopsResults[domain] = "fetching…" }
-        pump()
-    }
-
-    // hops:// for the WebView (callback-style, per resource — DESIGN.md §30).
-    // android-13: each WebView callback carries a deadline so a resolve/response that never arrives
-    // (dead domain, dropped request) is expired instead of latching a dead callback forever. Expiry
-    // matches the 30s UI timeout; the entries are touched only on the core thread.
-    private val hopsWebPending = HashMap<String, MutableList<Triple<String, (Int, String, ByteArray) -> Unit, Long>>>()
-    private val hopsWebReqs = HashMap<List<Byte>, Pair<(Int, String, ByteArray) -> Unit, Long>>()
-    private val HOPS_WEB_TTL_MS = 30_000L
+    fun openHops(input: String) = hns.openHops(input)
 
     /// Fetch one hops:// resource for the WebView, calling back with (status, contentType, body).
-    fun hopsFetch(url: String, cb: (Int, String, ByteArray) -> Unit) {
-        core.post {
-            val (domain, path) = parseHops(url)
-            if (domain.isEmpty()) { cb(400, "text/plain; charset=utf-8", "bad url".toByteArray()); return@post }
-            when (val r = node.resolveHns(domain)) {
-                is HnsLookupResult.Cached ->
-                    if (r.address.isEmpty()) cb(502, "text/plain; charset=utf-8", "no hops endpoint for $domain".toByteArray())
-                    else fireHopsWeb(domain, path, r.address, cb)
-                is HnsLookupResult.Pending -> hopsWebPending.getOrPut(domain) { mutableListOf() }.add(Triple(path, cb, System.currentTimeMillis() + HOPS_WEB_TTL_MS))
-                is HnsLookupResult.NeedsResolver -> cb(503, "text/plain; charset=utf-8", "offline".toByteArray())
-            }
-            pump()
-        }
-    }
-
-    /// android-13: expire WebView fetch callbacks whose HNS resolve or hops response never arrived, so a
-    /// dead domain / dropped request fails the UI (matching its 30s timeout) instead of latching a dead
-    /// callback + its WebView worker forever. Runs on core (same thread that populates the maps).
-    private fun expireHopsWeb() {
-        val now = System.currentTimeMillis()
-        val reqIt = hopsWebReqs.entries.iterator()
-        while (reqIt.hasNext()) {
-            val (cb, deadline) = reqIt.next().value
-            if (now >= deadline) { reqIt.remove(); cb(504, "text/plain; charset=utf-8", "timeout".toByteArray()) }
-        }
-        val penIt = hopsWebPending.entries.iterator()
-        while (penIt.hasNext()) {
-            val e = penIt.next()
-            e.value.removeAll { (_, cb, deadline) ->
-                (now >= deadline).also { if (it) cb(504, "text/plain; charset=utf-8", "timeout".toByteArray()) }
-            }
-            if (e.value.isEmpty()) penIt.remove()
-        }
-    }
-
-    private fun fireHopsWeb(domain: String, path: String, endpoint: ByteArray, cb: (Int, String, ByteArray) -> Unit) {
-        nameByAddr[endpoint.toList()] = domain
-        val id = runCatching {
-            node.sendHopsRequest(endpoint, domain, "GET", path, ByteArray(0), 8u * 1024u * 1024u)
-        }.getOrNull()
-        if (id == null) { cb(502, "text/plain; charset=utf-8", "send failed".toByteArray()); return }
-        hopsWebReqs[id.toList()] = cb to (System.currentTimeMillis() + HOPS_WEB_TTL_MS)
-        pump()
-    }
-
-    private fun drainHns() {
-        for (rec in node.takeHnsResults()) {
-            // WebView fetches queued on this domain's resolution take priority.
-            hopsWebPending.remove(rec.domain)?.let { queued ->
-                for ((path, cb, _) in queued) {
-                    if (rec.address.isEmpty()) cb(502, "text/plain; charset=utf-8", "no hops endpoint for ${rec.domain}".toByteArray())
-                    else fireHopsWeb(rec.domain, path, rec.address, cb)
-                }
-            }
-            val path = pendingHops.remove(rec.domain) ?: continue // the text-box fetch
-            if (rec.address.isEmpty()) { val d = rec.domain; onUi { hopsResults[d] = "error: no hops endpoint for $d" } }
-            else fireHops(rec.domain, path, rec.address)
-        }
-        for (resp in node.takeHttpResponses()) {
-            val webCb = hopsWebReqs.remove(resp.forRequestId.toList())?.first
-            if (webCb != null) { webCb(resp.status.toInt(), resp.contentType, resp.body); continue }
-            val domain = hopsReqs.remove(resp.forRequestId.toList()) ?: continue
-            val line = "${resp.status} · ${String(resp.body)}"
-            onUi { hopsResults[domain] = line }
-        }
-        // Host DNS hook (§30): fetch each requested domain's full DNSSEC chain over DoH and hand
-        // core the raw bodies — core validates to the root anchors and decides the address.
-        for (domain in node.takeDnsLookups()) fetchDnssecChain(domain)
-        // Refresh the cache debug view.
-        val cacheRows = runCatching { node.hnsCache() }.getOrDefault(emptyList())
-            .map { HnsCacheRow(it.domain, it.address, it.ttlSecs) }
-        onUi { hnsCache.clear(); hnsCache.addAll(cacheRows) }
-    }
-
-    /// Fetch a domain's DNSSEC chain over DNS-over-HTTPS (TXT _hopaddress + DNSKEY/DS per zone to
-    /// root, all do=1), then feed the raw JSON bodies to core (§30). Concurrent GETs.
-    private fun fetchDnssecChain(domain: String) {
-        val queries = ArrayList<Pair<String, Int>>()
-        queries.add("_hopaddress.$domain" to 16) // TXT
-        var zone = domain
-        while (true) {
-            queries.add(zone to 48) // DNSKEY
-            if (zone == ".") break
-            queries.add(zone to 43) // DS
-            zone = if (zone.contains(".")) zone.substringAfter(".") else "."
-        }
-        val bodies = java.util.Collections.synchronizedList(ArrayList<String>())
-        val remaining = java.util.concurrent.atomic.AtomicInteger(queries.size)
-        for ((name, qtype) in queries) {
-            val req = Request.Builder().url("${config.dohResolverUrl}?name=$name&type=$qtype&do=1").build()
-            dohClient.newCall(req).enqueue(object : okhttp3.Callback {
-                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) { done() }
-                override fun onResponse(call: okhttp3.Call, response: Response) {
-                    response.use { it.body?.string()?.let { b -> bodies.add(b) } }
-                    done()
-                }
-                private fun done() {
-                    if (remaining.decrementAndGet() == 0) core.post {
-                        runCatching { node.provideDnsProof(domain, ArrayList(bodies)) }
-                        pump()
-                    }
-                }
-            })
-        }
-    }
-
-    /// Parse a hops:// URL (or bare domain) into (domain, path). The endpoint validates host,
-    /// so we pass the bare domain and just the path.
-    private fun parseHops(input: String): Pair<String, String> {
-        var s = input.trim().removePrefix("hops://").removePrefix("https://").removePrefix("http://")
-        val slash = s.indexOf('/')
-        val domain = (if (slash >= 0) s.substring(0, slash) else s).lowercase()
-        val path = if (slash >= 0) s.substring(slash) else "/"
-        return domain to path
-    }
+    fun hopsFetch(url: String, cb: (Int, String, ByteArray) -> Unit) = hns.hopsFetch(url, cb)
 
     // ---- cloud relay bearer (→ hop-relayd) ----------------------------------
 
@@ -1006,7 +730,7 @@ class HopBearer internal constructor(
         }
         // Validate BEFORE persisting: junk (or an http:// / random text) would be handed straight to the
         // RelayBearer's OkHttp WebSocket dial at the next launch and fail obscurely. Reject it here so a
-        // bad pin never latches into prefs (the device only ever talks to ONE relay — a bad pin is a
+        // bad pin never latches into prefs (the device only ever talks to ONE relay - a bad pin is a
         // silent outage). Accepts wss:// / https:// / ws:// URLs and bare host:port (raw-TCP path A).
         val pinned = validateRelayUrl(raw)
         if (pinned == null) {
@@ -1022,43 +746,7 @@ class HopBearer internal constructor(
 
     private val messagesFile get() = java.io.File(context.filesDir, "messages.json")
     private val contactsFile get() = java.io.File(context.filesDir, "contacts.json")
-    /// Image blobs live here as individual content-addressed files, referenced by name from
-    /// messages.json (android-12). This keeps the mirror JSON small so the debounced rewrite doesn't
-    /// re-base64 megabytes of photo bytes on every message burst.
-    private val mediaDir get() = java.io.File(context.filesDir, "media").apply { mkdirs() }
-    /// Content hashes already flushed to [mediaDir]; lets writeMessages skip re-writing unchanged blobs.
-    private val writtenMedia = java.util.Collections.synchronizedSet(HashSet<String>())
     private var lastContactSaveMs = 0L
-
-    /// Store [bytes] as a content-addressed file under [mediaDir] and return its reference name. The
-    /// same image (by SHA-256) is written at most once; a re-send of the same photo dedupes on disk.
-    private fun putMedia(bytes: ByteArray): String {
-        val name = mediaName(bytes)
-        if (writtenMedia.add(name)) {
-            val f = java.io.File(mediaDir, name)
-            // android-r2-01: seal the photo blob with the db key so media/* is not plaintext at rest.
-            if (!f.exists()) runCatching { f.writeBytes(MirrorCrypto.seal(config.dbKey, bytes)) }
-        }
-        return name
-    }
-
-    private fun getMedia(name: String): ByteArray? =
-        runCatching { java.io.File(mediaDir, name).readBytes() }.getOrNull()
-            ?.let { blob -> MirrorCrypto.open(config.dbKey, blob) ?: blob }   // sealed, or legacy plaintext
-
-    /// android-r2-01: read a sealed mirror file back to its plaintext JSON string. Opens the sealed
-    /// (AES-GCM, Keystore-wrapped-key) form; if the bytes are a LEGACY plaintext mirror from before
-    /// at-rest encryption (or a plain-SQLite dev build with an empty key), returns them as text so the
-    /// old file is read once and rewritten sealed. Returns null if the file is absent/unreadable.
-    private fun readMirror(f: java.io.File): String? {
-        val blob = runCatching { f.readBytes() }.getOrNull() ?: return null
-        return MirrorCrypto.open(config.dbKey, blob)?.let { String(it) } ?: String(blob)
-    }
-
-    private fun mediaName(bytes: ByteArray): String {
-        val h = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
-        return android.util.Base64.encodeToString(h, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING)
-    }
 
     /// Add a contact by base58 address (manual entry or scanned QR). Returns false if invalid.
     /// An empty name resolves via hop.identify; a provided name is kept as the local alias.
@@ -1090,13 +778,12 @@ class HopBearer internal constructor(
             ContactRecord(addressBase58(it.address), it.name, it.platform, it.app)
         }
         val json = ContactBook.encode(records)
-        val key = config.dbKey
         // android-r2-01: seal the address book with the db key so contacts.json (addresses + names) is
         // not plaintext beside the encrypted hop.db. Off the main thread (refresh runs often).
-        thread(name = "save-contacts") { runCatching { contactsFile.writeBytes(MirrorCrypto.seal(key, json.toByteArray())) } }
+        thread(name = "save-contacts") { runCatching { contactsFile.writeBytes(mirror.seal(json.toByteArray())) } }
     }
     private fun loadContacts() {
-        val txt = readMirror(contactsFile) ?: return
+        val txt = mirror.read(contactsFile) ?: return
         // quality-net-03: parse through the pure ContactBook codec (unit-tested); the driver then does
         // the core-owned base58 -> bytes conversion + 32-byte validation.
         for (rec in ContactBook.decode(txt)) {
@@ -1111,8 +798,8 @@ class HopBearer internal constructor(
     }
     private var saveScheduled = false
 
-    /// Coalesce rapid mutations into one disk write (~1/sec) so a burst of messages — or the
-    /// per-tick pump() — doesn't re-encode the whole history each time.
+    /// Coalesce rapid mutations into one disk write (~1/sec) so a burst of messages - or the
+    /// per-tick pump() - doesn't re-encode the whole history each time.
     private fun saveMessages() {
         if (saveScheduled) return
         saveScheduled = true
@@ -1128,111 +815,32 @@ class HopBearer internal constructor(
         // Externalize images to disk here (dedupes via writtenMedia); the JSON build below just refs.
         val imgRefs = HashMap<Long, Pair<String?, List<String>>>()
         for (m in snapshot) {
-            val single = m.imageData?.let { putMedia(it) }
-            val multi = if (m.images.isNotEmpty()) m.images.map { putMedia(it) } else emptyList()
+            val single = m.imageData?.let { mirror.putMedia(it) }
+            val multi = if (m.images.isNotEmpty()) m.images.map { mirror.putMedia(it) } else emptyList()
             if (single != null || multi.isNotEmpty()) imgRefs[m.localId] = single to multi
         }
-        val key = config.dbKey
         thread(name = "save-messages") {
-            val arr = org.json.JSONArray()
-            for (m in snapshot) {
-                val o = org.json.JSONObject()
-                o.put("peer", m.peer); o.put("text", m.text); o.put("incoming", m.incoming)
-                o.put("contentType", m.contentType)
-                val refs = imgRefs[m.localId]
-                refs?.first?.let { o.put("imageRef", it) }
-                refs?.second?.takeIf { it.isNotEmpty() }?.let { o.put("imageRefs", org.json.JSONArray(it)) }
-                o.put("hops", m.hops.toInt())
-                m.latencyMs?.let { o.put("latencyMs", it.toLong()) }
-                if (m.trace.isNotEmpty()) o.put("trace", org.json.JSONArray(m.trace))
-                o.put("sentAt", m.sentAt)
-                m.deliveredAt?.let { o.put("deliveredAt", it) }
-                o.put("relayed", m.relayed.toLong())
-                o.put("delivered", m.delivered); o.put("deliveryHops", m.deliveryHops.toInt())
-                m.deliveryMs?.let { o.put("deliveryMs", it.toLong()) } // forward-path (A→B) latency
-                o.put("failed", m.failed)
-                // Keep the bundleId: the node re-sprays undelivered own-bundles after restart (node.rs
-                // rehydrate); persisting it lets refresh() re-query messageStatus and flip to Delivered.
-                m.bundleId?.let { o.put("bundleId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
-                arr.put(o)
-            }
+            // MessageCodec owns the messages.json schema (the pure List<Message> <-> JSON transform);
+            // the CPU-bound encode stays on this background thread, exactly as the inline loop did.
+            val json = MessageCodec.encode(snapshot, imgRefs)
             // android-r2-01: seal the chat mirror with the db key so messages.json (every body) is not
             // plaintext beside the encrypted hop.db (empty key ⇒ plain, matching an unencrypted db).
-            runCatching { messagesFile.writeBytes(MirrorCrypto.seal(key, arr.toString().toByteArray())) }
+            runCatching { messagesFile.writeBytes(mirror.seal(json.toByteArray())) }
         }
     }
 
     private fun loadMessages() {
-        val txt = readMirror(messagesFile) ?: return
-        val arr = runCatching { org.json.JSONArray(txt) }.getOrNull() ?: return
-        val loaded = ArrayList<Message>()
-        for (i in 0 until arr.length()) {
-            val o = arr.getJSONObject(i)
-            val incoming = o.getBoolean("incoming")
-            val delivered = o.optBoolean("delivered", false)
-            // New format: images referenced by content-addressed file name (android-12). Legacy format:
-            // inline base64 under "imageData"/"images", still read so old mirrors keep working.
-            val single: ByteArray? = when {
-                o.has("imageRef") -> getMedia(o.getString("imageRef"))
-                o.has("imageData") -> android.util.Base64.decode(o.getString("imageData"), android.util.Base64.NO_WRAP)
-                else -> null
-            }
-            val imgs: List<ByteArray> = o.optJSONArray("imageRefs")?.let { a ->
-                (0 until a.length()).mapNotNull { getMedia(a.getString(it)) }
-            } ?: o.optJSONArray("images")?.let { a ->
-                (0 until a.length()).map { android.util.Base64.decode(a.getString(it), android.util.Base64.NO_WRAP) }
-            } ?: emptyList()
-            val trace = o.optJSONArray("trace")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
-            loaded.add(Message(
-                localId = nextMsgId.getAndIncrement(), peer = o.getString("peer"), text = o.optString("text", ""),
-                incoming = incoming, contentType = o.optString("contentType", "text/plain"),
-                imageData = single,
-                images = imgs, hops = o.optInt("hops", 0).toUByte(),
-                latencyMs = if (o.has("latencyMs")) o.getLong("latencyMs").toULong() else null,
-                trace = trace, sentAt = o.optLong("sentAt", System.currentTimeMillis()),
-                deliveredAt = if (o.has("deliveredAt")) o.getLong("deliveredAt") else null,
-                relayed = o.optLong("relayed", 0).toUInt(), delivered = delivered,
-                deliveryHops = o.optInt("deliveryHops", 0).toUByte(),
-                deliveryMs = if (o.has("deliveryMs")) o.getLong("deliveryMs").toULong() else null,
-                // An outgoing message still in flight KEEPS sending after restart — the node re-sprays
-                // it until its ACK (node.rs rehydrate). Restore it in-flight with its bundleId so
-                // refresh() reconciles to Delivered when it lands, rather than falsely showing "not sent".
-                failed = o.optBoolean("failed", false),
-                bundleId = if (o.has("bundleId")) android.util.Base64.decode(o.getString("bundleId"), android.util.Base64.NO_WRAP) else null,
-            ))
-        }
+        val txt = mirror.read(messagesFile) ?: return
+        // MessageCodec parses the schema; the driver supplies fresh local ids (in file order) and the
+        // media resolver, then applies the restored rows on main (messages is UI/main-owned).
+        val loaded = MessageCodec.decode(txt, { nextMsgId.getAndIncrement() }, mirror::getMedia)
         onUi { messages.addAll(loaded) }
-    }
-
-    private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "Hop messages", NotificationManager.IMPORTANCE_DEFAULT)
-            context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
-    }
-
-    private fun notify(from: String, text: String) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) return
-        val n = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(config.notificationIcon)
-            .setContentTitle(from)
-            .setContentText(text)
-            .setAutoCancel(true)
-            .setNumber(unread.intValue)   // drives the launcher icon badge count
-            .setBadgeIconType(NotificationCompat.BADGE_ICON_SMALL)
-            .build()
-        // android-r2-06: unique per-notification id (was text.hashCode(), which collided across
-        // messages with identical text, silently replacing an earlier distinct notification).
-        NotificationManagerCompat.from(context).notify(nextNotifId.getAndIncrement(), n)
     }
 
     @Volatile private var refreshScheduled = false
 
     /// Coalesced UI refresh. `refresh()` does synchronous SQLite work (browse, queue, per-message
-    /// status) and is far too costly to run on every `pump()` — which fires on every received packet
+    /// status) and is far too costly to run on every `pump()` - which fires on every received packet
     /// across BLE/Wi-Fi/LAN/relay. Per-packet refresh saturates the main thread (sluggish UI, ANRs).
     /// Coalesce to ~4 Hz; pump still drains outgoing + the inbox immediately, only this is throttled.
     private fun scheduleRefresh() {
@@ -1346,9 +954,9 @@ class HopBearer internal constructor(
         /// Cap on simultaneously in-flight DoH (DNSSEC-chain) GETs so a burst of hops:// resolves can't
         /// spawn unbounded concurrent HTTPS requests; excess calls queue on the dispatcher instead.
         const val DOH_MAX_CONCURRENT = 6
-        /// Shared app secret for Hop Debug — all our demo devices use it so they interoperate.
+        /// Shared app secret for Hop Debug - all our demo devices use it so they interoperate.
         /// A different app (different secret) can't see or join these channels (DESIGN.md §32).
-        val APP_SECRET = ByteArray(32) { 0x48 } // "H" ×32 — dev build only (matches iOS)
+        val APP_SECRET = ByteArray(32) { 0x48 } // "H" ×32 - dev build only (matches iOS)
 
         @Volatile private var inst: HopBearer? = null
 
@@ -1456,7 +1064,7 @@ class HopBearer internal constructor(
         /// Validate + normalize a user-entered relay URL before it is persisted as the pinned relay.
         /// The shared RelayBearer dials this over an OkHttp WebSocket (`Request.url(...)`), which accepts
         /// only ws/wss/https/http schemes and requires a non-empty host. Returns the trimmed URL if it is
-        /// a well-formed wss:// / https:// (or ws:// / http://) URL with a host, else null — so junk, a
+        /// a well-formed wss:// / https:// (or ws:// / http://) URL with a host, else null - so junk, a
         /// bare word, or a random string never latches into prefs as a silent relay outage. Pure + host-
         /// free so it is unit-testable on a plain JVM.
         fun validateRelayUrl(input: String): String? {
