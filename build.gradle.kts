@@ -1,6 +1,7 @@
 plugins {
     id("com.android.library")
     id("org.jetbrains.kotlin.android")
+    jacoco
 }
 
 android {
@@ -16,6 +17,9 @@ android {
     // library's BuildConfig.DEBUG tracks the CONSUMING app's build type (debug lib for a debug app,
     // release lib for a release app), so a release APK compiles with these affordances gone.
     buildFeatures { buildConfig = true }
+
+    // quality-cov: JVM unit-test line coverage (AGP wires jacoco + createDebugUnitTestCoverageReport).
+    buildTypes { debug { enableUnitTestCoverage = true } }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_1_8
@@ -66,4 +70,26 @@ dependencies {
     // ContactBook's JSON round-trip is exercised for real).
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+}
+
+// quality-cov: line-coverage report over the DRIVER'S OWN Kotlin (sh.hopme.driver.**). The generated
+// UniFFI JNA bindings (uniffi.hop.**, ~1500 lines under android/HopDemo/generated) are third-party,
+// machine-generated glue that is never unit-tested, so they are excluded from the denominator here —
+// otherwise they alone drag the module to single digits regardless of how well the driver is covered.
+// Reads the exec that AGP's enableUnitTestCoverage produces from testDebugUnitTest.
+tasks.register<JacocoReport>("jacocoDriverReport") {
+    dependsOn("testDebugUnitTest")
+    reports {
+        xml.required.set(true)
+        html.required.set(true)
+    }
+    classDirectories.setFrom(
+        fileTree("${buildDir}/tmp/kotlin-classes/debug") {
+            exclude("uniffi/**")   // generated UniFFI bindings — not the driver's product code
+        },
+    )
+    sourceDirectories.setFrom(files("src/main/java"))
+    executionData.setFrom(
+        fileTree(buildDir) { include("outputs/unit_test_code_coverage/debugUnitTest/testDebugUnitTest.exec") },
+    )
 }
