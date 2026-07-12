@@ -57,7 +57,7 @@ class HopBearer internal constructor(
     // Identity derived from the device (stable, storage-independent - §4); the db path
     // persists messages across restarts. Both come from the host-supplied HopConfig.
     // F-25: open SQLCipher-encrypted with the device-derived db key (empty ⇒ plain). Only encrypts
-    // when libhop is built `--features sqlcipher` (android/build-aar.sh, on by default).
+    // when libhop is built `--features sqlcipher` (tools/build-aar.sh, on by default).
     // Typed to the UniFFI-generated HopNodeInterface (not the concrete HopNode) so a unit test can
     // inject an in-memory fake; production passes injectedNode=null and this initializer opens the real
     // keyed node, byte-for-byte the same openKeyed call as before the seam was added.
