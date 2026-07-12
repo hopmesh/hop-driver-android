@@ -80,7 +80,7 @@ android {
 dependencies {
     // UniFFI-generated Kotlin uses JNA; the @aar variant bundles its native libs. `api` so the
     // generated `uniffi.hop.*` types stay usable from consumers (the app references them).
-    api("net.java.dev.jna:jna:5.14.0@aar")
+    api("net.java.dev.jna:jna:5.19.1@aar")
 
     // The bearer exposes Compose snapshot state (mutableStateOf/…), so the runtime is part of the
     // driver's public surface - `api` so consuming UI observes the same snapshot system.
@@ -116,7 +116,7 @@ dependencies {
     // The main `jna@aar` bundles only Android jnidispatch .so; the JVM test JVM needs the DESKTOP
     // jnidispatch (com/sun/jna/<os-arch>/libjnidispatch), which ships in the plain jar. This lets JNA
     // boot on the host so the driver's UniFFI free functions can call the real libhop (jna.library.path).
-    testImplementation("net.java.dev.jna:jna:5.14.0")
+    testImplementation("net.java.dev.jna:jna:5.19.1")
     // MockWebServer backs the DoH (DNSSEC-chain) fetch test with a fake resolver, no real network.
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }
