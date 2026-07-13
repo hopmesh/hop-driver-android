@@ -99,7 +99,7 @@ class DriverFormatTest {
 
     @Test fun companionConstantsAreTheDeployedValues() {
         assertEquals("wss://relay.hopme.sh/", HopBearer.DEFAULT_RELAY)
-        assertEquals(6, HopBearer.DOH_MAX_CONCURRENT)
+        assertEquals(6, HopBearer.HNS_MAX_CONCURRENT)
         assertEquals(600_000u, HopBearer.PRESENCE_TTL_MS)
         // APP_SECRET is the shared dev-fabric secret ("H" x32); byte-identical to iOS or the fabrics split.
         assertEquals(32, HopBearer.APP_SECRET.size)

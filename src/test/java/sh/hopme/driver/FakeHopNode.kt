@@ -87,7 +87,7 @@ class FakeHopNode(
     val registered = mutableListOf<String>()
     val hpsPublished = mutableListOf<Pair<String, ByteArray>>()
     val hpsSubscribed = mutableListOf<String>()
-    val dnsProofs = mutableListOf<Pair<String, List<String>>>()
+    val reachRecords = mutableListOf<Pair<String, ByteArray>>()      // domain -> raw reach-record bytes
     val connectedLinks = mutableListOf<ULong>()
     val disconnectedLinks = mutableListOf<ULong>()
     val received = mutableListOf<Pair<ULong, ByteArray>>()
@@ -184,7 +184,6 @@ class FakeHopNode(
 
     // HNS + hops:// (§30)
     override fun resolveHns(domain: String): HnsLookupResult = resolve(domain)
-    override fun resolveHnsVia(resolver: ByteArray, domain: String): ByteArray = nextId()
     override fun sendHopsRequest(endpoint: ByteArray, host: String, method: String, url: String, body: ByteArray, maxResp: UInt): ByteArray {
         hopsRequests.add(host); return nextId().also { lastHopsReqId = it }
     }
@@ -193,6 +192,6 @@ class FakeHopNode(
     override fun takeHttpResponses(): List<HttpResp> = drain(pendingHttpResponses)
     override fun takeHttpRequests(): List<HttpReq> = drain(pendingHttpRequests)
     override fun takeDnsLookups(): List<String> = drain(pendingDnsLookups)
-    override fun provideDnsProof(domain: String, bodies: List<String>) { dnsProofs.add(domain to bodies) }
+    override fun provideReachRecord(domain: String, record: ByteArray) { reachRecords.add(domain to record) }
     override fun signReachRecord(endpoint: String, ttlSecs: UInt): ByteArray = ByteArray(0)
 }

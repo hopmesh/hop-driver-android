@@ -13,13 +13,17 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * HNS + hops:// concern (DESIGN.md §30), split out of the [HopBearer] god-object into a cohesive
  * controller the driver composes. Owns the hops:// text-box results, the WebView fetch callbacks (with
- * their 30s deadlines), the HNS cache debug view, and the bounded DoH (DNSSEC-chain) HTTP client.
+ * their 30s deadlines), the HNS cache debug view, and the bounded well-known reach-record HTTP client.
+ *
+ * Name resolution is a single HTTPS GET of `https://<domain>/.well-known/hop`: the domain's own TLS
+ * cert proves the domain, and the self-certifying reach record served there binds the domain to a Hop
+ * address (verified in core against the address that signed it). No DNSSEC, no DoH resolver.
  *
  * The threading model is unchanged: every method here runs on the driver's serial `core` thread (the
  * same Handler the rest of the node work runs on), and every Compose-state mutation is marshaled to main
  * via [onUi]. The driver injects the node seam, the core Handler, onUi, [pump] (drainHns is still called
  * from pump(); the pump()-after-send calls are preserved verbatim), the shared [nameByAddr] map, and the
- * DoH resolver config. Behavior-identical to the code that previously lived inline in HopBearer.
+ * HNS resolver-base override. Behavior-identical to the code that previously lived inline in HopBearer.
  */
 internal class HnsController(
     private val node: HopNodeInterface,
@@ -27,21 +31,21 @@ internal class HnsController(
     private val onUi: (() -> Unit) -> Unit,
     private val pump: () -> Unit,
     private val nameByAddr: ConcurrentHashMap<List<Byte>, String>,
-    private val dohResolverUrl: String,
-    dohMaxConcurrent: Int,
+    private val hnsResolverBase: String,
+    hnsMaxConcurrent: Int,
 ) {
     // hops:// (DESIGN.md §30): domain → rendered result; pending resolves + outstanding requests.
     val hopsResults = mutableStateMapOf<String, String>()
     private val pendingHops = HashMap<String, String>()              // domain → path awaiting resolve
     private val hopsReqs = HashMap<List<Byte>, String>()             // request id → domain
-    // DoH client for DNSSEC-chain fetches (§30). BOUNDED concurrency: fetchDnssecChain enqueues one GET
-    // per zone/record, so a burst of resolves (a page that references many hops:// domains, or a flood of
-    // takeDnsLookups) could otherwise spawn an unbounded number of in-flight HTTPS requests and exhaust
-    // sockets/threads. Cap the dispatcher so excess calls queue instead of all firing at once.
-    private val dohClient = OkHttpClient.Builder()
+    // HTTP client for well-known reach-record fetches (§30). BOUNDED concurrency: a burst of resolves
+    // (a page that references many hops:// domains, or a flood of takeDnsLookups) could otherwise spawn
+    // an unbounded number of in-flight HTTPS GETs and exhaust sockets/threads. Cap the dispatcher so
+    // excess calls queue instead of all firing at once. maxRequestsPerHost stays at the OkHttp default
+    // (5) since each domain is its own host now (the GET goes to the domain being resolved).
+    private val httpClient = OkHttpClient.Builder()
         .dispatcher(okhttp3.Dispatcher().apply {
-            maxRequests = dohMaxConcurrent              // total in-flight GETs across all domains
-            maxRequestsPerHost = dohMaxConcurrent       // all go to one host (dns.google), so cap it too
+            maxRequests = hnsMaxConcurrent              // total in-flight GETs across all domains
         })
         .build()
     // HNS cache debug view: domain → (address, ttl).
@@ -148,45 +152,47 @@ internal class HnsController(
             val line = "${resp.status} · ${String(resp.body)}"
             onUi { hopsResults[domain] = line }
         }
-        // Host DNS hook (§30): fetch each requested domain's full DNSSEC chain over DoH and hand
-        // core the raw bodies, and core validates to the root anchors and decides the address.
-        for (domain in node.takeDnsLookups()) fetchDnssecChain(domain)
+        // Host resolver hook (§30): fetch each requested domain's `/.well-known/hop` reach record over
+        // HTTPS and hand core the raw record bytes; core verifies the self-certifying signature and
+        // decides the address (the domain's TLS cert proved the domain).
+        for (domain in node.takeDnsLookups()) fetchReachRecord(domain)
         // Refresh the cache debug view.
         val cacheRows = runCatching { node.hnsCache() }.getOrDefault(emptyList())
             .map { HopBearer.HnsCacheRow(it.domain, it.address, it.ttlSecs) }
         onUi { hnsCache.clear(); hnsCache.addAll(cacheRows) }
     }
 
-    /// Fetch a domain's DNSSEC chain over DNS-over-HTTPS (TXT _hopaddress + DNSKEY/DS per zone to
-    /// root, all do=1), then feed the raw JSON bodies to core (§30). Concurrent GETs.
-    private fun fetchDnssecChain(domain: String) {
-        val queries = ArrayList<Pair<String, Int>>()
-        queries.add("_hopaddress.$domain" to 16) // TXT
-        var zone = domain
-        while (true) {
-            queries.add(zone to 48) // DNSKEY
-            if (zone == ".") break
-            queries.add(zone to 43) // DS
-            zone = if (zone.contains(".")) zone.substringAfter(".") else "."
-        }
-        val bodies = java.util.Collections.synchronizedList(ArrayList<String>())
-        val remaining = java.util.concurrent.atomic.AtomicInteger(queries.size)
-        for ((name, qtype) in queries) {
-            val req = Request.Builder().url("$dohResolverUrl?name=$name&type=$qtype&do=1").build()
-            dohClient.newCall(req).enqueue(object : okhttp3.Callback {
-                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) { done() }
-                override fun onResponse(call: okhttp3.Call, response: Response) {
-                    response.use { it.body?.string()?.let { b -> bodies.add(b) } }
-                    done()
+    /// Fetch a domain's `/.well-known/hop` reach record over HTTPS and feed the raw record bytes to
+    /// core (§30). One GET per resolve. The body is JSON `{address, endpoint, reach}` where `reach` is
+    /// the base64 (std) postcard reach record; we hand core those decoded bytes, and it verifies the
+    /// self-certifying signature. Any failure (network, non-200, malformed body) hands core an empty
+    /// record, which it negative-caches. In production the base is `https://<domain>`; a non-empty
+    /// [hnsResolverBase] override (tests, or a shared resolver) replaces just the scheme+host.
+    private fun fetchReachRecord(domain: String) {
+        val base = if (hnsResolverBase.isNotEmpty()) hnsResolverBase.trimEnd('/') else "https://$domain"
+        val req = Request.Builder().url("$base/.well-known/hop").build()
+        httpClient.newCall(req).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) { deliver(ByteArray(0)) }
+            override fun onResponse(call: okhttp3.Call, response: Response) {
+                val record = response.use {
+                    if (!it.isSuccessful) ByteArray(0)
+                    else runCatching { parseReachRecord(it.body?.string().orEmpty()) }.getOrDefault(ByteArray(0))
                 }
-                private fun done() {
-                    if (remaining.decrementAndGet() == 0) core.post {
-                        runCatching { node.provideDnsProof(domain, ArrayList(bodies)) }
-                        pump()
-                    }
-                }
-            })
-        }
+                deliver(record)
+            }
+            private fun deliver(record: ByteArray) = core.post {
+                runCatching { node.provideReachRecord(domain, record) }
+                pump()
+            }
+        })
+    }
+
+    /// Pull the `reach` field out of a `/.well-known/hop` JSON body and base64-decode it to the raw
+    /// reach-record bytes. Returns empty if the field is absent or not valid base64.
+    private fun parseReachRecord(body: String): ByteArray {
+        val reachB64 = org.json.JSONObject(body).optString("reach", "")
+        if (reachB64.isEmpty()) return ByteArray(0)
+        return runCatching { java.util.Base64.getDecoder().decode(reachB64) }.getOrDefault(ByteArray(0))
     }
 
     /// Parse a hops:// URL (or bare domain) into (domain, path). The endpoint validates host,
@@ -199,10 +205,10 @@ internal class HnsController(
         return domain to path
     }
 
-    /// Release the DoH client's dispatcher thread pool + connection pool (bounded, but still held).
+    /// Release the HTTP client's dispatcher thread pool + connection pool (bounded, but still held).
     /// Mirrors the teardown cleanup that previously lived inline in HopBearer.teardown().
     fun shutdown() {
-        runCatching { dohClient.dispatcher.executorService.shutdown() }
-        runCatching { dohClient.connectionPool.evictAll() }
+        runCatching { httpClient.dispatcher.executorService.shutdown() }
+        runCatching { httpClient.connectionPool.evictAll() }
     }
 }

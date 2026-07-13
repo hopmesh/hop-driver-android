@@ -141,9 +141,9 @@ dependencies {
     // jnidispatch (com/sun/jna/<os-arch>/libjnidispatch), which ships in the plain jar. This lets JNA
     // boot on the host so the driver's UniFFI free functions can call the real libhop (jna.library.path).
     testImplementation("net.java.dev.jna:jna:5.19.1")
-    // MockWebServer backs the DoH (DNSSEC-chain) fetch test with a fake resolver, no real network. OkHttp 5
-    // still publishes this legacy `mockwebserver` coordinate as a deprecated bridge over the OLD
-    // okhttp3.mockwebserver package, so HopBearerDnssecTest's imports are unchanged.
+    // MockWebServer backs the well-known reach-record fetch test with a fake origin, no real network.
+    // OkHttp 5 still publishes this legacy `mockwebserver` coordinate as a deprecated bridge over the OLD
+    // okhttp3.mockwebserver package, so HopBearerReachFetchTest's imports are unchanged.
     testImplementation("com.squareup.okhttp3:mockwebserver:5.4.0")
 }
 

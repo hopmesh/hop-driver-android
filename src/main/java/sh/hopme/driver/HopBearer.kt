@@ -163,9 +163,9 @@ class HopBearer internal constructor(
     private val nameByAddr = java.util.concurrent.ConcurrentHashMap<List<Byte>, String>()
 
     // HNS + hops:// concern (§30), composed here now that node/core/nameByAddr exist. Every method runs
-    // on `core`; drainHns() is still called from pump(), expireHopsWeb() from the tick loop, and the DoH
-    // client is released in teardown() via hns.shutdown().
-    private val hns = HnsController(node, core, ::onUi, ::pump, nameByAddr, config.dohResolverUrl, DOH_MAX_CONCURRENT)
+    // on `core`; drainHns() is still called from pump(), expireHopsWeb() from the tick loop, and the
+    // well-known HTTP client is released in teardown() via hns.shutdown().
+    private val hns = HnsController(node, core, ::onUi, ::pump, nameByAddr, config.hnsResolverBase, HNS_MAX_CONCURRENT)
     /// hops:// text-box results (domain → rendered result). Delegates to [HnsController] so the app keeps
     /// observing the same Compose snapshot map (`bearer.hopsResults`).
     val hopsResults get() = hns.hopsResults
@@ -370,8 +370,8 @@ class HopBearer internal constructor(
         }, 1000)
     }
 
-    /// Release every long-lived resource this driver owns: the shared bearers (radios/sockets), the DoH
-    /// HTTP client, the serial core HandlerThread, and the libhop node handle. This is the cleanup path
+    /// Release every long-lived resource this driver owns: the shared bearers (radios/sockets), the
+    /// well-known HTTP client, the serial core HandlerThread, and the libhop node handle. This is the cleanup path
     /// for a process-level teardown (e.g. an owning foreground service's onDestroy); the current demo
     /// creates the singleton from an Activity and relies on process death, so it is not yet wired to a
     /// lifecycle callback, but it is kept correct and crash-safe so wiring it is a one-liner.
@@ -392,7 +392,7 @@ class HopBearer internal constructor(
         synchronized(Companion) { if (inst === this) inst = null }
         // Stop the radios/sockets first so no new link event races the node close.
         runCatching { bearerMgr.stop() }
-        // Release the DoH client's dispatcher thread pool + connection pool (bounded, but still held).
+        // Release the well-known HTTP client's dispatcher thread pool + connection pool (bounded, but still held).
         hns.shutdown()
         // Drain the core queue THEN close the node + quit the thread, so any already-queued node work
         // finishes before the handle is freed (closing under an in-flight node.* call is a use-after-free).
@@ -951,9 +951,9 @@ class HopBearer internal constructor(
         const val PRESENCE_SERVICE = "presence"
         const val PRESENCE_TTL_MS: UInt = 600_000u
         const val DEFAULT_RELAY = "wss://relay.hopme.sh/"
-        /// Cap on simultaneously in-flight DoH (DNSSEC-chain) GETs so a burst of hops:// resolves can't
-        /// spawn unbounded concurrent HTTPS requests; excess calls queue on the dispatcher instead.
-        const val DOH_MAX_CONCURRENT = 6
+        /// Cap on simultaneously in-flight well-known reach-record GETs so a burst of hops:// resolves
+        /// can't spawn unbounded concurrent HTTPS requests; excess calls queue on the dispatcher instead.
+        const val HNS_MAX_CONCURRENT = 6
         /// Shared app secret for Hop Debug - all our demo devices use it so they interoperate.
         /// A different app (different secret) can't see or join these channels (DESIGN.md §32).
         val APP_SECRET = ByteArray(32) { 0x48 } // "H" ×32 - dev build only (matches iOS)
