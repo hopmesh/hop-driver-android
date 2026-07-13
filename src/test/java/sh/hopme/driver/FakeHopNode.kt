@@ -194,4 +194,5 @@ class FakeHopNode(
     override fun takeHttpRequests(): List<HttpReq> = drain(pendingHttpRequests)
     override fun takeDnsLookups(): List<String> = drain(pendingDnsLookups)
     override fun provideDnsProof(domain: String, bodies: List<String>) { dnsProofs.add(domain to bodies) }
+    override fun signReachRecord(endpoint: String, ttlSecs: UInt): ByteArray = ByteArray(0)
 }
