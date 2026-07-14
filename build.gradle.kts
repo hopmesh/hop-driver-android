@@ -136,7 +136,7 @@ dependencies {
     // Handler+Looper / NotificationManager / Base64 / Log / File IO) so the ~1150-line HopBearer instance
     // and HopService run headless on the JVM - no device, no emulator.
     testImplementation("org.robolectric:robolectric:4.13")
-    testImplementation("androidx.test:core:1.6.1")
+    testImplementation("androidx.test:core:1.7.0")
     // The main `jna@aar` bundles only Android jnidispatch .so; the JVM test JVM needs the DESKTOP
     // jnidispatch (com/sun/jna/<os-arch>/libjnidispatch), which ships in the plain jar. This lets JNA
     // boot on the host so the driver's UniFFI free functions can call the real libhop (jna.library.path).
