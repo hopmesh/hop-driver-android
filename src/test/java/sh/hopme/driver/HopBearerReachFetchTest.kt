@@ -15,7 +15,7 @@ import java.util.Base64
 /** cov/android-driver: fetchReachRecord() - the host resolver hook (§30). node.takeDnsLookups() hands
  *  the driver a domain; it fetches `https://<domain>/.well-known/hop` (here a MockWebServer via the
  *  hnsResolverBase override) and feeds the decoded reach-record bytes back to node.provideReachRecord.
- *  No real network, no DNSSEC. */
+ *  No real network. */
 class HopBearerReachFetchTest : DriverTestBase() {
 
     // A canned reach record the well-known serves; the driver must base64-decode `reach` and hand these

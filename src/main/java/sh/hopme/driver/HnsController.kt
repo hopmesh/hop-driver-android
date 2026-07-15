@@ -17,7 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * Name resolution is a single HTTPS GET of `https://<domain>/.well-known/hop`: the domain's own TLS
  * cert proves the domain, and the self-certifying reach record served there binds the domain to a Hop
- * address (verified in core against the address that signed it). No DNSSEC, no DoH resolver.
+ * address (verified in core against the address that signed it). No DoH resolver.
  *
  * The threading model is unchanged: every method here runs on the driver's serial `core` thread (the
  * same Handler the rest of the node work runs on), and every Compose-state mutation is marshaled to main
