@@ -19,11 +19,21 @@ import java.time.Duration
  *  in both the plaintext (empty key) and AES-GCM-sealed (32-byte key) forms. */
 class HopBearerPersistenceTest : DriverTestBase() {
 
+    private fun stopForRestart(bearer: HopBearer) {
+        bearer.teardown()
+        runCatching { shadowOf(bearer.coreLooper).idle() }
+    }
+
     private fun restart(cfg: HopConfig): HopBearer {
         val b = newBearer(FakeHopNode(), cfg)
         b.start("Restart")
         settleOn(b)
         return b
+    }
+
+    private fun restart(previous: HopBearer, cfg: HopConfig): HopBearer {
+        stopForRestart(previous)
+        return restart(cfg)
     }
 
     @Test fun messagesAndMediaSurviveARestart() {
@@ -34,7 +44,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         settleOn(b1)
         assertTrue(awaitFileContains(filesFile("messages.json"), "persist me"))
 
-        val b2 = restart(cfg)
+        val b2 = restart(b1, cfg)
         assertTrue("text survived", b2.messages.any { it.text == "persist me" })
         assertTrue("image survived via media/", b2.messages.any { it.imageData != null })
     }
@@ -47,7 +57,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         settleOn(b1)
         assertTrue(awaitFileContains(filesFile("contacts.json"), "Dana"))
 
-        val b2 = restart(cfg)
+        val b2 = restart(b1, cfg)
         assertEquals("Dana", b2.displayName(addr))
     }
 
@@ -61,7 +71,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         settleOn(b1)
         assertTrue(awaitFileContains(filesFile("channels.json"), "persisted post"))
 
-        val b2 = restart(cfg)
+        val b2 = restart(b1, cfg)
         val thread = b2.hpsThreads[topic.id]
         assertTrue("channel post survived", thread != null && thread.any { it.text == "persisted post" })
     }
@@ -75,7 +85,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         val bytes = filesFile("messages.json").readBytes()
         assertTrue("mirror is AES-GCM sealed, not plaintext JSON", MirrorCrypto.isSealed(bytes))
 
-        val b2 = restart(cfg)
+        val b2 = restart(b1, cfg)
         assertTrue("sealed history re-read on restart", b2.messages.any { it.text == "secret msg" })
     }
 
@@ -90,7 +100,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         assertTrue(awaitFileContains(filesFile("messages.json"), "cleartext"))
         val bytes = filesFile("messages.json").readBytes()
         assertTrue("empty key => plaintext JSON array", bytes.isNotEmpty() && bytes[0] == '['.code.toByte())
-        val b2 = restart(cfg)
+        val b2 = restart(b1, cfg)
         assertTrue(b2.messages.any { it.text == "cleartext" })
     }
 
@@ -100,6 +110,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         b1.send("older", HopBearer.Peer(ByteArray(32) { 9 }, "Old", 0u))
         settleOn(b1)
         assertTrue(awaitFileContains(filesFile("messages.json"), "older"))
+        stopForRestart(b1)
 
         val fake2 = FakeHopNode()
         fake2.pendingInbox.add(InboxMessage(
@@ -146,7 +157,7 @@ class HopBearerPersistenceTest : DriverTestBase() {
         b1.deleteConversation(peer)
         settleOn(b1)
         assertTrue(b1.messages.none { it.peer == b1.keyFor(peer) })
-        val b2 = restart(cfg)
+        val b2 = restart(b1, cfg)
         assertTrue(b2.messages.none { it.peer == b2.keyFor(peer) })
     }
 
