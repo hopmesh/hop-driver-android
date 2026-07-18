@@ -47,7 +47,7 @@ class HopBearerSendTest : DriverTestBase() {
         settle()
         assertEquals("multipart/mixed", fake.sentMessages[0].contentType)
         // the wire body decodes back to text + 2 images
-        val parts = HopBearer.decodeMultipart(fake.sentMessages[0].body)
+        val parts = (HopBearer.decodeMultipart(fake.sentMessages[0].body) as MultipartDecodeResult.Success).parts
         assertEquals(3, parts.size)
         assertEquals("text/plain", parts[0].first)
         assertEquals("caption", String(parts[0].second))

@@ -7,7 +7,6 @@ import android.os.HandlerThread
 import android.os.Looper
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import kotlin.concurrent.thread
 import androidx.compose.runtime.mutableStateMapOf
 import uniffi.hop.HopNode
 import uniffi.hop.HopNodeInterface
@@ -16,6 +15,22 @@ import uniffi.hop.addressBase58
 import uniffi.hop.addressFromBase58
 import uniffi.hop.decodeIdentity
 import uniffi.hop.serviceIdentify
+
+enum class MultipartDecodeFailure {
+    TRUNCATED,
+    TOO_MANY_PARTS,
+    CONTENT_TYPE_TOO_LARGE,
+    PART_TOO_LARGE,
+    AGGREGATE_TOO_LARGE,
+    TRAILING_BYTES,
+}
+
+sealed interface MultipartDecodeResult {
+    data class Success(val parts: List<Pair<String, ByteArray>>) : MultipartDecodeResult
+    data class Failure(val reason: MultipartDecodeFailure) : MultipartDecodeResult
+}
+
+enum class SendResult { QUEUED, INVALID, OVERLOADED }
 
 /**
  * The Android Hop driver: owns the libhop node, the app-model (messages / peers / hps / chat), and
@@ -33,6 +48,7 @@ class HopBearer internal constructor(
     // app (a separate Gradle module) still MUST go through [shared]. Production passes null (see the
     // 2-arg secondary constructor), so the initializer opens the real keyed node exactly as before.
     injectedNode: HopNodeInterface?,
+    private val retentionLimits: RetentionLimits = RetentionPolicy.defaults,
 ) {
 
     data class Peer(
@@ -42,6 +58,7 @@ class HopBearer internal constructor(
     data class Message(
         val localId: Long, val peer: String, val text: String, val incoming: Boolean,
         val bundleId: ByteArray? = null,
+        val inboxId: ByteArray? = null,
         val contentType: String = "text/plain",
         val imageData: ByteArray? = null,                            // set for a single image/* message
         val images: List<ByteArray> = emptyList(),                   // one+ images of a multipart message
@@ -73,7 +90,7 @@ class HopBearer internal constructor(
      * node (SQLCipher at rest when built `--features sqlcipher`). Behavior-identical to the prior
      * behavior; [shared] uses this path.
      */
-    private constructor(context: Context, config: HopConfig) : this(context, config, null)
+    private constructor(context: Context, config: HopConfig) : this(context, config, null, RetentionPolicy.defaults)
     val peers = mutableStateListOf<Peer>()
     /// Persistent address book: everyone we've seen, messaged, or been messaged by, keyed by address.
     /// `seen` is the subset NOT currently reachable - so past conversations stay reachable even when
@@ -104,8 +121,10 @@ class HopBearer internal constructor(
     val serviceLog = mutableStateListOf<String>()
     val queue = mutableStateListOf<QueueRow>()
     data class QueueRow(val own: Boolean, val to: String, val priority: UByte, val hops: UByte)
-    private val identifyAsked = HashSet<List<Byte>>()   // addresses we've sent hop.identify to
-    private val identifyReqs = HashSet<List<Byte>>()    // outstanding identify request ids
+    private val identifyAsked = BoundedLruSet<List<Byte>>(retentionLimits.metadataEntries)
+    private val identifyReqs = BoundedLruSet<List<Byte>>(retentionLimits.metadataEntries)
+    private val dispatchedServiceResponses = HashSet<List<Byte>>()
+    private val deliveredServiceResponses = HashMap<List<Byte>, ByteArray>()
     data class HpsTopic(
         val host: ByteArray, val path: String, val channel: Boolean, val hosting: Boolean,
         val access: uniffi.hop.HpsAccess = uniffi.hop.HpsAccess.OPEN,
@@ -113,7 +132,13 @@ class HopBearer internal constructor(
         val id: String get() = addressBase58(host) + "/" + path
         val writable: Boolean get() = channel || hosting
     }
-    data class HpsMsg(val id: Long, val path: String, val sender: ByteArray, val text: String)
+    data class HpsMsg(
+        val id: Long,
+        val path: String,
+        val sender: ByteArray,
+        val text: String,
+        val inboxId: ByteArray? = null,
+    )
     var myAddress = mutableStateOf("")
     var myName = mutableStateOf("")
     // Core also READS our name/address/private-mode (publishPresence, LAN discovery), so those live
@@ -126,6 +151,7 @@ class HopBearer internal constructor(
     /// relay-capable and reachable by anyone who already has our address (scanned QR / manual add).
     val privateMode = mutableStateOf(false)
     var status = mutableStateOf("starting…")
+    val persistenceError = mutableStateOf<String?>(null)
     var relayStatus = mutableStateOf("not connected")
     private val prefs get() = context.getSharedPreferences("hop", android.content.Context.MODE_PRIVATE)
     /// A relay the user pinned by direct address (persisted). A device only ever talks to ONE
@@ -133,12 +159,16 @@ class HopBearer internal constructor(
     /// specific relay, rather than publishing presence to several at once.
     val pinnedRelay = mutableStateOf<String?>(null)
     private val nextMsgId = java.util.concurrent.atomic.AtomicLong(0L)
+    private val pendingQuota = PendingQuota(retentionLimits)
+    private val durableInboxIds = BoundedLruSet<List<Byte>>(
+        retentionLimits.globalMessages + retentionLimits.pendingGlobalMessages + retentionLimits.journalRecords,
+    )
     /// Notifications concern (message channel + incoming-message notification + badge). Split out of the
     /// god-object into [Notifier]; the driver composes it and posts from pump().
     private val notifier = Notifier(context, CHANNEL_ID, config.notificationIcon)
     /// At-rest mirror store (seal/open + content-addressed media) the three persistence mirrors share.
     /// Split out of the god-object into [MirrorStore]; wraps [MirrorCrypto] with the device db key.
-    private val mirror = MirrorStore(config.dbKey, context.filesDir)
+    private val mirror = MirrorStore(config.dbKey, context.noBackupFilesDir, context.filesDir, retentionLimits)
     @Volatile private var appActive = true
     private val appName: String =
         context.applicationInfo.loadLabel(context.packageManager).toString()
@@ -157,15 +187,20 @@ class HopBearer internal constructor(
      *  background HandlerThread deterministically with ShadowLooper.idle()/idleFor(). No production use. */
     internal val coreLooper: Looper get() = coreThread.looper
     /// Marshal a Compose-state update to the main thread. UI (snapshot) state mutates ONLY here.
-    private fun onUi(block: () -> Unit) { main.post(block) }
+    private fun onUi(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else main.post(block)
+    }
     private var lastPeerLinkCount = -1
-    // Read from the UI thread (displayName) and written on core (refresh/pump), so concurrent-safe.
-    private val nameByAddr = java.util.concurrent.ConcurrentHashMap<List<Byte>, String>()
+    // Sender-controlled names are access-order bounded independently of peer churn.
+    private val nameByAddr = BoundedLruMap<List<Byte>, String>(retentionLimits.metadataEntries)
 
     // HNS + hops:// concern (§30), composed here now that node/core/nameByAddr exist. Every method runs
     // on `core`; drainHns() is still called from pump(), expireHopsWeb() from the tick loop, and the
     // well-known HTTP client is released in teardown() via hns.shutdown().
-    private val hns = HnsController(node, core, ::onUi, ::pump, nameByAddr, config.hnsResolverBase, HNS_MAX_CONCURRENT)
+    private val hns = HnsController(
+        node, core, ::onUi, ::pump, { address, name -> nameByAddr[address] = name },
+        config.hnsResolverBase, HNS_MAX_CONCURRENT,
+    )
     /// hops:// text-box results (domain → rendered result). Delegates to [HnsController] so the app keeps
     /// observing the same Compose snapshot map (`bearer.hopsResults`).
     val hopsResults get() = hns.hopsResults
@@ -174,7 +209,7 @@ class HopBearer internal constructor(
 
     // hps:// pub/sub concern (§32), composed here now that node/core/mirror exist. drainHps() is called
     // from pump(); loadChannels()/loadTopics() from start(). The app-facing state is re-exposed below.
-    private val hps = HpsController(node, core, ::onUi, ::pump, { nextMsgId.getAndIncrement() }, mirror, context.filesDir)
+    private val hps = HpsController(node, core, ::onUi, ::pump, { nextMsgId.getAndIncrement() }, mirror)
     /// Topics we host/subscribe. Delegates to [HpsController] (`bearer.hpsTopics`).
     val hpsTopics get() = hps.hpsTopics
     /// Per-topic message threads (topic id → messages). Delegates to [HpsController] (`bearer.hpsThreads`).
@@ -398,6 +433,7 @@ class HopBearer internal constructor(
         // finishes before the handle is freed (closing under an in-flight node.* call is a use-after-free).
         core.post {
             core.removeCallbacksAndMessages(null)   // drop the self-reposting tick + any pending tasks
+            runCatching { mirror.flushAndClose() }
             // close() is on the concrete HopNode (AutoCloseable), not on HopNodeInterface (the seam type).
             // The real production node IS AutoCloseable, so this still frees the libhop handle; a unit
             // test's in-memory fake that doesn't implement AutoCloseable is simply a no-op here.
@@ -454,18 +490,20 @@ class HopBearer internal constructor(
      *  android-r2-03: this is a silent send-as-user primitive, so it is inert unless the automation
      *  surface is enabled (debug builds only) - defense in depth beside the debug-only manifest filter
      *  and the BuildConfig.DEBUG guard in the activity. */
-    fun sendTo(addrBase58: String, text: String) {
-        if (!DriverFlags.automationSurface) return   // release: refuse driven sends (android-r2-03)
-        val addr = runCatching { addressFromBase58(addrBase58.trim()) }.getOrNull() ?: return
-        send(text, Peer(addr, contacts[addr.toList()]?.name ?: "", 0u, active = false))
+    fun sendTo(addrBase58: String, text: String): SendResult {
+        if (!DriverFlags.automationSurface) return SendResult.INVALID
+        val addr = runCatching { addressFromBase58(addrBase58.trim()) }.getOrNull()
+            ?: return SendResult.INVALID
+        return send(text, Peer(addr, contacts[addr.toList()]?.name ?: "", 0u, active = false))
     }
 
-    fun send(text: String, to: Peer) {
+    fun send(text: String, to: Peer): SendResult {
         // Optimistic insert: the bubble appears INSTANTLY (next main frame), decoupled from the serial
         // core thread + the blocking node.sendMessage. The node send + the bundleId (for delivery
         // tracking) fill in on core and patch back by localId. (Prior bug: the append ran INSIDE
         // core.post AFTER node.sendMessage, so a busy core stalled the bubble for seconds - felt frozen.)
         val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(to.address), text = text, incoming = false, bundleId = null)
+        if (!reservePending(msg)) return SendResult.OVERLOADED
         onUi { messages.add(msg) }
         core.post {
             rememberContact(to)   // messaging someone adds them to your address book
@@ -474,6 +512,7 @@ class HopBearer internal constructor(
             stampSent(msg.localId, r.getOrNull())
             pump()
         }
+        return SendResult.QUEUED
     }
 
     /// Patch an optimistically-inserted outgoing message with the bundleId returned by node.sendMessage.
@@ -484,51 +523,88 @@ class HopBearer internal constructor(
     private fun stampSent(localId: Long, id: ByteArray?) = onUi {
         val i = messages.indexOfFirst { it.localId == localId }
         if (i < 0) return@onUi
-        messages[i] = if (id != null) messages[i].copy(bundleId = id) else messages[i].copy(failed = true)
+        messages[i] = if (id != null) messages[i].copy(bundleId = id) else {
+            pendingQuota.release(localId)
+            messages[i].copy(failed = true)
+        }
     }
 
     /// Send an image - large bodies are transparently carrier-chunked + reassembled by core
     /// (DESIGN.md §20), same path as a text message but a binary content type.
-    fun sendImage(data: ByteArray, to: Peer) {
-        val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(to.address), text = "", incoming = false,
+    fun sendImage(data: ByteArray, to: Peer): SendResult {
+        if (data.size.toLong() > retentionLimits.attachmentBytes) {
+            return SendResult.OVERLOADED
+        }
+        val peerKey = addressBase58(to.address)
+        val msg = Message(localId = nextMsgId.getAndIncrement(), peer = peerKey, text = "", incoming = false,
             bundleId = null, contentType = "image/jpeg", imageData = data)
-        onUi { messages.add(msg) }   // optimistic - instant bubble (see send())
+        if (!reservePending(msg)) return SendResult.OVERLOADED
+        val durable = RetentionPolicy.retain(messageSnapshot(listOf(msg)), retentionLimits)
+        if (!persistMessagesNow(durable)) {
+            pendingQuota.release(msg.localId)
+            return SendResult.OVERLOADED
+        }
+        val retainedIds = durable.mapTo(HashSet()) { it.localId }
+        onUi {
+            messages.removeAll { it.localId !in retainedIds }
+            messages.add(msg)
+        }
         core.post {
             rememberContact(to)
             val id = runCatching { node.sendMessage(to.address, "image/jpeg", data, true) }.getOrNull()
             stampSent(msg.localId, id)
             pump()
         }
+        return SendResult.QUEUED
     }
 
     /// Send text and/or one-or-more images as ONE message (multipart/mixed) - a single sealed
     /// payload (DESIGN.md §20/§32). Wire format shared with iOS:
     /// `[u32 partCount][ per part: u16 ctLen, ct, u32 bodyLen, body ]`.
-    fun sendMultipart(text: String, images: List<ByteArray>, to: Peer) {
+    fun sendMultipart(text: String, images: List<ByteArray>, to: Peer): SendResult {
         val t = text.trim()
         val parts = ArrayList<Pair<String, ByteArray>>()
         if (t.isNotEmpty()) parts.add("text/plain" to t.toByteArray())
         for (img in images) parts.add("image/jpeg" to img)
-        if (parts.isEmpty()) return
-        val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(to.address), text = t, incoming = false,
+        if (parts.isEmpty()) return SendResult.INVALID
+        if (images.any { it.size.toLong() > retentionLimits.attachmentBytes }) {
+            return SendResult.OVERLOADED
+        }
+        val peerKey = addressBase58(to.address)
+        val msg = Message(localId = nextMsgId.getAndIncrement(), peer = peerKey, text = t, incoming = false,
             bundleId = null, contentType = "multipart/mixed", images = images)
-        onUi { messages.add(msg) }   // optimistic - instant bubble (see send())
+        if (!reservePending(msg)) return SendResult.OVERLOADED
+        val encoded = runCatching { encodeMultipart(parts) }.getOrNull() ?: run {
+            pendingQuota.release(msg.localId)
+            return SendResult.INVALID
+        }
+        val durable = RetentionPolicy.retain(messageSnapshot(listOf(msg)), retentionLimits)
+        if (!persistMessagesNow(durable)) {
+            pendingQuota.release(msg.localId)
+            return SendResult.OVERLOADED
+        }
+        val retainedIds = durable.mapTo(HashSet()) { it.localId }
+        onUi {
+            messages.removeAll { it.localId !in retainedIds }
+            messages.add(msg)
+        }
         core.post {
             rememberContact(to)
-            val id = runCatching { node.sendMessage(to.address, "multipart/mixed", encodeMultipart(parts), true) }.getOrNull()
+            val id = runCatching { node.sendMessage(to.address, "multipart/mixed", encoded, true) }.getOrNull()
             stampSent(msg.localId, id)
             pump()
         }
+        return SendResult.QUEUED
     }
 
     /// Re-send a failed ("Not sent") message in place. Recovery for a message that gave up
     /// (queue cleared, or still unsent at a restart). `to` supplies the address (Message stores
     /// only the peer name).
-    fun retry(m: Message, to: Peer) = core.post {
-        if (m.incoming) return@post
+    fun retry(m: Message, to: Peer): SendResult {
+        if (m.incoming) return SendResult.INVALID
         val ctBody: Pair<String, ByteArray> = when {
             m.contentType.startsWith("image/") -> {
-                val d = m.imageData ?: return@post
+                val d = m.imageData ?: return SendResult.INVALID
                 "image/jpeg" to d
             }
             m.contentType == "multipart/mixed" -> {
@@ -536,19 +612,30 @@ class HopBearer internal constructor(
                 if (m.text.isNotEmpty()) parts.add("text/plain" to m.text.toByteArray())
                 val imgs = if (m.imageData != null) listOf(m.imageData) else m.images
                 for (img in imgs) parts.add("image/jpeg" to img)
-                if (parts.isEmpty()) return@post
-                "multipart/mixed" to encodeMultipart(parts)
+                if (parts.isEmpty()) return SendResult.INVALID
+                "multipart/mixed" to (runCatching { encodeMultipart(parts) }.getOrNull()
+                    ?: return SendResult.INVALID)
             }
             else -> "text/plain" to m.text.toByteArray()
         }
-        val id = runCatching { node.sendMessage(to.address, ctBody.first, ctBody.second, true) }.getOrNull()
-        onUi {
-            val i = messages.indexOfFirst { it.localId == m.localId }
-            if (i >= 0) messages[i] = m.copy(failed = false, delivered = false, bundleId = id,
-                sentAt = System.currentTimeMillis())
+        val pending = m.copy(failed = false, delivered = false, bundleId = null,
+            sentAt = System.currentTimeMillis())
+        if (!reservePending(pending)) return SendResult.OVERLOADED
+        core.post {
+            val id = runCatching { node.sendMessage(to.address, ctBody.first, ctBody.second, true) }.getOrNull()
+            if (id == null) pendingQuota.release(m.localId)
+            onUi {
+                val i = messages.indexOfFirst { it.localId == m.localId }
+                if (i >= 0) messages[i] = pending.copy(bundleId = id, failed = id == null)
+            }
+            pump()
         }
-        pump()
+        return SendResult.QUEUED
     }
+
+    private fun reservePending(message: Message): Boolean = pendingQuota.reserve(
+        message.localId, message.peer, message.peer, RetentionPolicy.messageBytes(message),
+    ) == PendingAdmission.ACCEPTED
 
     private fun pump() {
         for (pkt in node.drainOutgoing()) {
@@ -558,21 +645,68 @@ class HopBearer internal constructor(
             bearerMgr.send(pkt.bytes, pkt.link.toLong())
         }
         scheduleRefresh()
+        var workingMessages = messageSnapshot()
+        val stagedMessages = ArrayList<Message>()
+        val stagedNotifications = ArrayList<Triple<Message, String, String>>()
+        var journalChanged = false
         for (m in node.takeInbox()) {
+            val stableId = m.id.toList()
+            if (stableId in durableInboxIds ||
+                workingMessages.any { existing -> existing.inboxId?.contentEquals(m.id) == true }) {
+                runCatching { node.acceptInbox(m.id) }
+                continue
+            }
             val who = nameByAddr[m.from.toList()] ?: shortHex(m.from)
+            val peerKey = addressBase58(m.from)
+            val contactKey = m.from.toList()
+            val knownIdentity = contacts.containsKey(contactKey)
             val isImage = m.contentType.startsWith("image/")
             val isMultipart = m.contentType == "multipart/mixed"
             var text = if (isImage) "" else String(m.body)
             var images: List<ByteArray> = emptyList()
             if (isMultipart) {
-                val parts = decodeMultipart(m.body)
+                val parts = when (val decoded = decodeMultipart(m.body)) {
+                    is MultipartDecodeResult.Success -> decoded.parts
+                    is MultipartDecodeResult.Failure -> {
+                        if (appendInboxDelta(m.id, null, workingMessages)) {
+                            durableInboxIds.add(stableId)
+                            journalChanged = true
+                            runCatching { node.acceptInbox(m.id) }
+                        }
+                        continue
+                    }
+                }
                 text = parts.firstOrNull { it.first.startsWith("text/") }?.let { String(it.second) } ?: ""
                 images = parts.filter { it.first.startsWith("image/") }.map { it.second }
             }
+            val attachments = if (isImage) listOf(m.body) else images
+            val mediaShapeAccepted = attachments.isEmpty() ||
+                (knownIdentity && attachments.all { it.size.toLong() <= retentionLimits.attachmentBytes })
+            if (isImage && !mediaShapeAccepted) {
+                if (!knownIdentity && appendInboxDelta(m.id, null, workingMessages)) {
+                    durableInboxIds.add(stableId)
+                    journalChanged = true
+                    runCatching { node.acceptInbox(m.id) }
+                }
+                continue
+            }
+            if (isMultipart && !mediaShapeAccepted) {
+                if (knownIdentity) continue
+                images = emptyList()
+                if (text.isEmpty()) {
+                    if (appendInboxDelta(m.id, null, workingMessages)) {
+                        durableInboxIds.add(stableId)
+                        journalChanged = true
+                        runCatching { node.acceptInbox(m.id) }
+                    }
+                    continue
+                }
+            }
             val now = nowMs()
             val latency = if (now >= m.createdAt) now - m.createdAt else 0uL
-            val msg = Message(localId = nextMsgId.getAndIncrement(), peer = addressBase58(m.from), text = text,
-                incoming = true, contentType = m.contentType,
+            val storedContentType = if (isMultipart && images.isEmpty()) "text/plain" else m.contentType
+            val msg = Message(localId = nextMsgId.getAndIncrement(), peer = peerKey, text = text,
+                incoming = true, inboxId = m.id, contentType = storedContentType,
                 imageData = if (isImage) m.body else null, images = images,
                 hops = m.hops, latencyMs = latency, trace = m.trace.map { traceLabel(it) })
             // quality-net-06: log inbound receipt to logcat the instant it lands, keyed by text (the
@@ -581,20 +715,42 @@ class HopBearer internal constructor(
             // (a release build must not leak addresses/message text to logcat).
             if (!isImage && DriverFlags.verboseContentLogs) android.util.Log.i("HOPLOG",
                 "HOPAUTO received from=${addressBase58(m.from)} hops=${m.hops} text=$text")
+            val retained = RetentionPolicy.retain(workingMessages + msg, retentionLimits)
+            val retainedMessage = retained.any { it.localId == msg.localId }
+            if (!appendInboxDelta(m.id, msg.takeIf { retainedMessage }, retained)) continue
+            durableInboxIds.add(stableId)
+            journalChanged = true
+            workingMessages = retained
+            runCatching { node.acceptInbox(m.id) }
+
             queueIdentify(m.from)   // learn the sender's display name (§29)
             // Someone who messages us joins the address book, so their conversation is reachable.
-            val k = m.from.toList()
-            if (!contacts.containsKey(k)) {
-                contacts[k] = Peer(m.from, who, 0u, active = false)
+            if (!knownIdentity && RetentionPolicy.canAddContact(contacts.size, alreadyKnown = false)) {
+                contacts[contactKey] = Peer(m.from, who, 0u, active = false)
                 saveContacts(force = true)
             }
             val notifyText = if (isImage) "Photo" else text  // system notifications can't render FA glyphs
-            onUi {   // UI-visible result → main thread
-                messages.add(msg)
-                if (!appInForeground) { unread.intValue += 1; notifier.notify(who, notifyText, unread.intValue) }
+            if (retainedMessage) {
+                stagedMessages.add(msg)
+                stagedNotifications.add(Triple(msg, who, notifyText))
             }
         }
-        saveMessages()
+        if (journalChanged) {
+            val retainedIds = workingMessages.mapTo(HashSet()) { it.localId }
+            reconcileVisibleMessages(workingMessages)
+            onUi {
+                for ((msg, who, notifyText) in stagedNotifications) {
+                    if (msg.localId !in retainedIds || messages.any { it.localId == msg.localId }) continue
+                    messages.add(msg)
+                    if (!appInForeground) {
+                        unread.intValue += 1
+                        notifier.notify(who, notifyText, unread.intValue)
+                    }
+                }
+            }
+            saveMessages()
+        }
+        if (!journalChanged) saveMessages()
         hps.drainHps()   // pub/sub messages (§32)
         hns.drainHns()   // HNS lookups + hops:// responses (§30)
         drainServices()  // hop.identify replies + custom service calls (§29)
@@ -620,8 +776,18 @@ class HopBearer internal constructor(
     }
 
     private fun drainServices() {
+        for ((key, id) in deliveredServiceResponses.toMap()) {
+            if (runCatching { node.acceptServiceResponse(id) }.getOrDefault(false)) {
+                deliveredServiceResponses.remove(key)
+                dispatchedServiceResponses.remove(key)
+            }
+        }
         val logLines = ArrayList<String>()
+        val accepted = ArrayList<ByteArray>()
         for (resp in node.takeServiceResponses()) {
+            val responseKey = resp.id.toList()
+            if (responseKey in dispatchedServiceResponses) continue
+            dispatchedServiceResponses.add(responseKey)
             val info = if (identifyReqs.remove(resp.forRequestId.toList()) && resp.status == 0u.toUShort())
                 runCatching { decodeIdentity(resp.body) }.getOrNull() else null
             if (info != null) {
@@ -640,6 +806,7 @@ class HopBearer internal constructor(
                 }.getOrNull() ?: "<${resp.body.size} bytes>"
                 logLines.add("service ← ${resp.status}: ${text.take(120)}")
             }
+            accepted.add(resp.id)
         }
         for (req in node.takeServiceRequests()) {
             // No custom services in the demo - reply 501 so the caller isn't left hanging.
@@ -650,6 +817,16 @@ class HopBearer internal constructor(
         onUi {
             for (line in logLines) serviceLog.add(0, line)
             while (serviceLog.size > 100) serviceLog.removeAt(serviceLog.size - 1)
+            core.post {
+                for (id in accepted) {
+                    val key = id.toList()
+                    deliveredServiceResponses[key] = id
+                    if (runCatching { node.acceptServiceResponse(id) }.getOrDefault(false)) {
+                        deliveredServiceResponses.remove(key)
+                        dispatchedServiceResponses.remove(key)
+                    }
+                }
+            }
         }
     }
 
@@ -667,7 +844,10 @@ class HopBearer internal constructor(
         onUi {
             for (i in messages.indices) {
                 val m = messages[i]
-                if (!m.incoming && !m.delivered && !m.failed) messages[i] = m.copy(failed = true)
+                if (!m.incoming && !m.delivered && !m.failed) {
+                    pendingQuota.release(m.localId)
+                    messages[i] = m.copy(failed = true)
+                }
             }
         }
         saveMessages()   // core; debounced write picks up the onUi mutation
@@ -701,7 +881,7 @@ class HopBearer internal constructor(
     /// Resolved display name for an address (its set name, or a short base58 prefix).
     fun displayName(addr: ByteArray): String = nameByAddr[addr.toList()] ?: shortHex(addr)
     /// Known peers as an invite-picker list (sorted by name).
-    val contactList: List<Peer> get() = peers.sortedBy { it.name.lowercase() }
+    val contactList: List<Peer> get() = contacts.values.sortedBy { it.name.lowercase() }
 
     // ---- HNS & hops:// (DESIGN.md §30) -------------------------------------
     // The concern lives in [HnsController]; HopBearer keeps the public entry points the app calls and
@@ -744,8 +924,8 @@ class HopBearer internal constructor(
 
     // MARK: chat-history persistence (survives app restart) ----------------------
 
-    private val messagesFile get() = java.io.File(context.filesDir, "messages.json")
-    private val contactsFile get() = java.io.File(context.filesDir, "contacts.json")
+    private val messagesFile get() = mirror.file("messages.json")
+    private val contactsFile get() = mirror.file("contacts.json")
     private var lastContactSaveMs = 0L
 
     /// Add a contact by base58 address (manual entry or scanned QR). Returns false if invalid.
@@ -753,6 +933,7 @@ class HopBearer internal constructor(
     fun addContact(name: String, base58: String): Boolean {
         val addr = runCatching { addressFromBase58(base58.trim()) }.getOrNull() ?: return false
         if (addr.size != 32 || addr.contentEquals(node.address())) return false
+        if (!RetentionPolicy.canAddContact(contacts.size, contacts.containsKey(addr.toList()))) return false
         val alias = name.trim()
         core.post {
             rememberContact(Peer(addr, alias.ifEmpty { shortHex(addr) }, 0u, active = false))
@@ -764,6 +945,7 @@ class HopBearer internal constructor(
 
     /// Add a peer to the address book and persist now (e.g. on send) so the conversation is reachable.
     fun rememberContact(p: Peer) {
+        if (!RetentionPolicy.canAddContact(contacts.size, contacts.containsKey(p.address.toList()))) return
         contacts[p.address.toList()] = p
         nameByAddr[p.address.toList()] = p.name
         saveContacts(force = true)
@@ -774,19 +956,25 @@ class HopBearer internal constructor(
         lastContactSaveMs = now
         // quality-net-03: serialize through the pure ContactBook codec (unit-tested round-trip). The
         // base58 conversion is core-owned (uniffi), so it happens here; the JSON shape is ContactBook's.
-        val records = contacts.values.map {
+        val records = contacts.values.sortedBy { addressBase58(it.address) }.map {
             ContactRecord(addressBase58(it.address), it.name, it.platform, it.app)
         }
         val json = ContactBook.encode(records)
         // android-r2-01: seal the address book with the db key so contacts.json (addresses + names) is
         // not plaintext beside the encrypted hop.db. Off the main thread (refresh runs often).
-        thread(name = "save-contacts") { runCatching { contactsFile.writeBytes(mirror.seal(json.toByteArray())) } }
+        mirror.enqueue("contacts") {
+            if (!mirror.write(contactsFile, json.toByteArray())) reportPersistenceFailure("contacts")
+        }
     }
     private fun loadContacts() {
         val txt = mirror.read(contactsFile) ?: return
         // quality-net-03: parse through the pure ContactBook codec (unit-tested); the driver then does
         // the core-owned base58 -> bytes conversion + 32-byte validation.
-        for (rec in ContactBook.decode(txt)) {
+        val decoded = ContactBook.decodeBounded(txt) ?: run {
+            mirror.quarantine(contactsFile)
+            return
+        }
+        for (rec in decoded.sortedBy { it.addr58 }) {
             val addr = runCatching { addressFromBase58(rec.addr58) }.getOrNull() ?: continue
             if (addr.size != 32) continue
             val key = addr.toList()
@@ -797,13 +985,22 @@ class HopBearer internal constructor(
         }
     }
     private var saveScheduled = false
+    private val messageCompactionDeadline = CompactionDeadline()
+    // Core-thread copy retained until restored history has landed on main. An inbox packet can arrive
+    // during that handoff; persistence must merge with the old history rather than overwrite it.
+    private var startupMessages: List<Message> = emptyList()
 
     /// Coalesce rapid mutations into one disk write (~1/sec) so a burst of messages - or the
     /// per-tick pump() - doesn't re-encode the whole history each time.
     private fun saveMessages() {
         if (saveScheduled) return
         saveScheduled = true
-        core.postDelayed({ saveScheduled = false; writeMessages() }, 1000)
+        val delay = messageCompactionDeadline.nextDelayMs(1_000, 5_000)
+        core.postDelayed({
+            saveScheduled = false
+            messageCompactionDeadline.clear()
+            writeMessages()
+        }, delay)
     }
 
     /// Snapshot the message list on the caller (core thread, the only writer of `messages`), externalize
@@ -811,30 +1008,127 @@ class HopBearer internal constructor(
     /// separate content-addressed files (android-12) and referenced by name, so the mirror stays small
     /// and the debounced rewrite never re-base64s photo bytes on the core/main path.
     private fun writeMessages() {
-        val snapshot = messages.toList()
-        // Externalize images to disk here (dedupes via writtenMedia); the JSON build below just refs.
-        val imgRefs = HashMap<Long, Pair<String?, List<String>>>()
-        for (m in snapshot) {
-            val single = m.imageData?.let { mirror.putMedia(it) }
-            val multi = if (m.images.isNotEmpty()) m.images.map { mirror.putMedia(it) } else emptyList()
-            if (single != null || multi.isNotEmpty()) imgRefs[m.localId] = single to multi
-        }
-        thread(name = "save-messages") {
-            // MessageCodec owns the messages.json schema (the pure List<Message> <-> JSON transform);
-            // the CPU-bound encode stays on this background thread, exactly as the inline loop did.
-            val json = MessageCodec.encode(snapshot, imgRefs)
-            // android-r2-01: seal the chat mirror with the db key so messages.json (every body) is not
-            // plaintext beside the encrypted hop.db (empty key ⇒ plain, matching an unencrypted db).
-            runCatching { messagesFile.writeBytes(mirror.seal(json.toByteArray())) }
+        val snapshot = RetentionPolicy.retain(messageSnapshot(), retentionLimits)
+        reconcileVisibleMessages(snapshot)
+        mirror.enqueueMessages(snapshot) { success ->
+            if (success) durableInboxIds.replaceAll(snapshot.mapNotNull { it.inboxId?.toList() })
+            else reportPersistenceFailure("messages")
         }
     }
 
+    private fun messageSnapshot(extra: List<Message> = emptyList()): List<Message> {
+        val byId = LinkedHashMap<Long, Message>()
+        for (message in startupMessages) byId[message.localId] = message
+        for (message in messages.toList()) byId[message.localId] = message
+        for (message in extra) byId[message.localId] = message
+        return byId.values.toList()
+    }
+
+    private fun appendInboxDelta(id: ByteArray, message: Message?, resulting: List<Message>): Boolean =
+        runCatching { mirror.appendMessageDelta(id, message, resulting) }.getOrDefault(false)
+            .also { if (!it) reportPersistenceFailure("inbox journal") }
+
+    /** Synchronous durable boundary used before core inbox acceptance and explicit deletion. */
+    private fun persistMessagesNow(snapshot: List<Message>): Boolean =
+        runCatching { mirror.saveMessages(snapshot) }.getOrDefault(false)
+            .also { success ->
+                if (success) durableInboxIds.replaceAll(snapshot.mapNotNull { it.inboxId?.toList() })
+                else reportPersistenceFailure("messages")
+            }
+
     private fun loadMessages() {
-        val txt = mirror.read(messagesFile) ?: return
-        // MessageCodec parses the schema; the driver supplies fresh local ids (in file order) and the
-        // media resolver, then applies the restored rows on main (messages is UI/main-owned).
-        val loaded = MessageCodec.decode(txt, { nextMsgId.getAndIncrement() }, mirror::getMedia)
-        onUi { messages.addAll(loaded) }
+        if (!mirror.reconcileMediaOnStartup()) {
+            reportPersistenceFailure("media startup reconciliation")
+            return
+        }
+        val txt = mirror.read(messagesFile)
+        val base = if (txt == null) {
+            emptyList()
+        } else {
+            MessageCodec.decodeBounded(txt, { nextMsgId.getAndIncrement() }, mirror::getMedia)
+                ?: run {
+                    mirror.quarantine(messagesFile)
+                    emptyList()
+                }
+        }
+        val byInboxId = LinkedHashMap<List<Byte>, Message>()
+        val withoutInboxId = ArrayList<Message>()
+        for (message in base) {
+            val id = message.inboxId
+            if (id == null) withoutInboxId.add(message) else {
+                byInboxId[id.toList()] = message
+                durableInboxIds.add(id.toList())
+            }
+        }
+        val replay = mirror.replayDeltas("messages")
+        for (record in replay.records) {
+            val key = record.id.toList()
+            durableInboxIds.add(key)
+            val payload = record.payload ?: continue
+            val decoded = MessageCodec.decodeBounded(
+                String(payload, Charsets.UTF_8), { nextMsgId.getAndIncrement() }, mirror::getMedia,
+                maximumElements = 1,
+            ) ?: continue
+            decoded.singleOrNull()?.let { byInboxId[key] = it }
+        }
+        val loaded = RetentionPolicy.retain(withoutInboxId + byInboxId.values, retentionLimits)
+        if (txt == null && replay.records.isEmpty()) {
+            if (!mirror.gcMedia(emptyList())) reportPersistenceFailure("media startup reconciliation")
+            return
+        }
+        if (!persistMessagesNow(loaded)) return
+        durableInboxIds.replaceAll(loaded.mapNotNull { it.inboxId?.toList() })
+        startupMessages = loaded
+        pendingQuota.reconcile(loaded)
+        onUi {
+            messages.addAll(loaded)
+            core.post { startupMessages = emptyList() }
+        }
+    }
+
+    private fun reconcileVisibleMessages(snapshot: List<Message>) {
+        val retained = snapshot.mapTo(HashSet()) { it.localId }
+        startupMessages = startupMessages.filter { it.localId in retained }
+        onUi { messages.removeAll { it.localId !in retained } }
+    }
+
+    private fun reportPersistenceFailure(area: String) {
+        onUi { persistenceError.value = "failed to persist $area" }
+    }
+
+    fun deleteConversation(peer: Peer) = deleteConversation(keyFor(peer))
+
+    fun deleteConversation(peerKey: String) = mutateHistory {
+        it.filterNot { message -> message.peer == peerKey }
+    }
+
+    fun deleteHistory(): Boolean {
+        onUi { unread.intValue = 0 }
+        return mutateHistory { emptyList() }
+    }
+
+    fun deleteMedia(peer: Peer? = null) {
+        val peerKey = peer?.let(::keyFor)
+        mutateHistory { current ->
+            current.map { message ->
+                if ((peerKey == null || message.peer == peerKey) &&
+                    (message.imageData != null || message.images.isNotEmpty())) {
+                    message.copy(contentType = "text/plain", imageData = null, images = emptyList())
+                } else message
+            }
+        }
+    }
+
+    private fun mutateHistory(transform: (List<Message>) -> List<Message>) = core.post {
+        val updated = transform(messageSnapshot())
+        if (!persistMessagesNow(updated)) return@post
+        pendingQuota.reconcile(updated)
+        startupMessages = updated
+        onUi {
+            messages.clear()
+            messages.addAll(updated)
+            core.post { startupMessages = emptyList() }
+        }
     }
 
     @Volatile private var refreshScheduled = false
@@ -842,7 +1136,7 @@ class HopBearer internal constructor(
     /// Coalesced UI refresh. `refresh()` does synchronous SQLite work (browse, queue, per-message
     /// status) and is far too costly to run on every `pump()` - which fires on every received packet
     /// across BLE/Wi-Fi/LAN/relay. Per-packet refresh saturates the main thread (sluggish UI, ANRs).
-    /// Coalesce to ~4 Hz; pump still drains outgoing + the inbox immediately, only this is throttled.
+    /// Coalesce to ~4 Hz; pump still drains outgoing and polls/persists the inbox immediately.
     private fun scheduleRefresh() {
         if (refreshScheduled) return
         refreshScheduled = true
@@ -902,7 +1196,10 @@ class HopBearer internal constructor(
         // Address book: fold every live peer into the (persisted) contact book; the contacts NOT
         // currently reachable form the offline "seen" list, so past conversations stay reachable
         // even when the peer is offline / out of range / after a restart.
-        for (p in list) contacts[p.address.toList()] = p
+        for (p in list) {
+            val key = p.address.toList()
+            if (RetentionPolicy.canAddContact(contacts.size, contacts.containsKey(key))) contacts[key] = p
+        }
         val here = list.map { it.address.toList() }.toHashSet()
         val off = contacts.filterKeys { it !in here }.values
             .map { it.copy(hops = 0u, active = false) }
@@ -928,6 +1225,7 @@ class HopBearer internal constructor(
                     "HOPAUTO delivered to=${m.peer} deliveryMs=${s.deliveryMs} hops=${s.deliveryHops} text=${m.text}")
                 msgUpdates.add(m.localId to m.copy(relayed = s.relayed, delivered = true,
                     deliveryHops = s.deliveryHops, deliveryMs = s.deliveryMs.toULong(), deliveredAt = now))
+                pendingQuota.release(m.localId)
             } else if (s.relayed != m.relayed) {
                 msgUpdates.add(m.localId to m.copy(relayed = s.relayed))
             }
@@ -954,6 +1252,10 @@ class HopBearer internal constructor(
         /// Cap on simultaneously in-flight well-known reach-record GETs so a burst of hops:// resolves
         /// can't spawn unbounded concurrent HTTPS requests; excess calls queue on the dispatcher instead.
         const val HNS_MAX_CONCURRENT = 6
+        const val MULTIPART_MAX_PARTS = 32
+        const val MULTIPART_MAX_CONTENT_TYPE_BYTES = 1_024
+        const val MULTIPART_MAX_PART_BYTES = 8 * 1_024 * 1_024
+        const val MULTIPART_MAX_AGGREGATE_BYTES = 15 * 1_024 * 1_024
         /// Shared app secret for Hop Debug - all our demo devices use it so they interoperate.
         /// A different app (different secret) can't see or join these channels (DESIGN.md §32).
         val APP_SECRET = ByteArray(32) { 0x48 } // "H" ×32 - dev build only (matches iOS)
@@ -979,33 +1281,82 @@ class HopBearer internal constructor(
             val out = java.io.ByteArrayOutputStream()
             fun u32(v: Int) { out.write(v ushr 24); out.write(v ushr 16); out.write(v ushr 8); out.write(v) }
             fun u16(v: Int) { out.write(v ushr 8); out.write(v) }
+            require(parts.size <= MULTIPART_MAX_PARTS) { "too many multipart parts" }
+            var aggregate = 0L
             u32(parts.size)
             for ((ct, body) in parts) {
-                val ctd = ct.toByteArray()
+                val ctd = ct.toByteArray(Charsets.UTF_8)
+                require(ctd.size <= MULTIPART_MAX_CONTENT_TYPE_BYTES) { "multipart content type too large" }
+                require(body.size <= MULTIPART_MAX_PART_BYTES) { "multipart part too large" }
+                aggregate += ctd.size.toLong() + body.size.toLong()
+                require(aggregate <= MULTIPART_MAX_AGGREGATE_BYTES) { "multipart aggregate too large" }
                 u16(ctd.size); out.write(ctd)
                 u32(body.size); out.write(body)
             }
             return out.toByteArray()
         }
 
-        /// Decode the multipart wire format into `(contentType, bytes)` parts.
-        fun decodeMultipart(data: ByteArray): List<Pair<String, ByteArray>> {
-            val parts = mutableListOf<Pair<String, ByteArray>>()
+        /// Decode attacker-controlled multipart bytes without partial success or unchecked allocation.
+        fun decodeMultipart(data: ByteArray): MultipartDecodeResult {
             var i = 0
-            fun u(n: Int): Int? {
-                if (i + n > data.size) return null
-                var v = 0; repeat(n) { v = (v shl 8) or (data[i].toInt() and 0xff); i++ }; return v
+            fun unsigned(width: Int): Long? {
+                if (width > data.size - i) return null
+                var value = 0L
+                repeat(width) {
+                    value = (value shl 8) or (data[i].toLong() and 0xffL)
+                    i += 1
+                }
+                return value
             }
-            val count = u(4) ?: return parts
-            repeat(count) {
-                val cl = u(2) ?: return parts
-                if (i + cl > data.size) return parts
-                val ct = String(data, i, cl); i += cl
-                val bl = u(4) ?: return parts
-                if (i + bl > data.size) return parts
-                parts.add(ct to data.copyOfRange(i, i + bl)); i += bl
+            fun hasRemaining(length: Long): Boolean = length <= (data.size - i).toLong()
+            fun aggregateFits(current: Long, length: Long): Boolean =
+                length <= MULTIPART_MAX_AGGREGATE_BYTES.toLong() - current
+
+            val count = unsigned(4)
+                ?: return MultipartDecodeResult.Failure(MultipartDecodeFailure.TRUNCATED)
+            if (count > MULTIPART_MAX_PARTS.toLong()) {
+                return MultipartDecodeResult.Failure(MultipartDecodeFailure.TOO_MANY_PARTS)
             }
-            return parts
+
+            val parts = ArrayList<Pair<String, ByteArray>>(count.toInt())
+            var aggregate = 0L
+            repeat(count.toInt()) {
+                val contentTypeLength = unsigned(2)
+                    ?: return MultipartDecodeResult.Failure(MultipartDecodeFailure.TRUNCATED)
+                if (contentTypeLength > MULTIPART_MAX_CONTENT_TYPE_BYTES.toLong()) {
+                    return MultipartDecodeResult.Failure(MultipartDecodeFailure.CONTENT_TYPE_TOO_LARGE)
+                }
+                if (!aggregateFits(aggregate, contentTypeLength)) {
+                    return MultipartDecodeResult.Failure(MultipartDecodeFailure.AGGREGATE_TOO_LARGE)
+                }
+                if (!hasRemaining(contentTypeLength)) {
+                    return MultipartDecodeResult.Failure(MultipartDecodeFailure.TRUNCATED)
+                }
+                val contentTypeStart = i
+                i += contentTypeLength.toInt()
+                aggregate += contentTypeLength
+                val contentType = String(data, contentTypeStart, contentTypeLength.toInt(), Charsets.UTF_8)
+
+                val bodyLength = unsigned(4)
+                    ?: return MultipartDecodeResult.Failure(MultipartDecodeFailure.TRUNCATED)
+                if (bodyLength > MULTIPART_MAX_PART_BYTES.toLong()) {
+                    return MultipartDecodeResult.Failure(MultipartDecodeFailure.PART_TOO_LARGE)
+                }
+                if (!aggregateFits(aggregate, bodyLength)) {
+                    return MultipartDecodeResult.Failure(MultipartDecodeFailure.AGGREGATE_TOO_LARGE)
+                }
+                if (!hasRemaining(bodyLength)) {
+                    return MultipartDecodeResult.Failure(MultipartDecodeFailure.TRUNCATED)
+                }
+                val bodyStart = i
+                i += bodyLength.toInt()
+                aggregate += bodyLength
+                parts.add(contentType to data.copyOfRange(bodyStart, i))
+            }
+            if (i != data.size) {
+                return MultipartDecodeResult.Failure(MultipartDecodeFailure.TRAILING_BYTES)
+            }
+            return MultipartDecodeResult.Success(parts)
         }
 
         /// Compact base58 prefix for display (full base58 via `addressBase58`).
@@ -1018,7 +1369,7 @@ class HopBearer internal constructor(
         /// `SHA-256("hop.identity.v1|ANDROID_ID")` value is adopted as the stored secret on first run,
         /// so the address does not change. See [KeystoreSecret].
         fun deviceSeed(context: Context): ByteArray =
-            KeystoreSecret.getOrCreate(context, "identity.v1", legacy = legacyDeviceSeed(context))
+            KeystoreSecret.deviceSecrets(context).identity
 
         /// 32-byte SQLCipher key for `hop.db` at rest (F-25), hardware-backed the same way as the
         /// identity seed and domain-separated from it (its own Keystore key + pref entry). The key is
@@ -1026,26 +1377,7 @@ class HopBearer internal constructor(
         /// device's secure element. Existing installs migrate from the old ANDROID_ID-derived key so the
         /// already-encrypted db still opens. Encrypts only when libhop is built `--features sqlcipher`.
         fun dbKey(context: Context): ByteArray =
-            KeystoreSecret.getOrCreate(context, "db.key.v1", legacy = legacyDbKey(context))
-
-        /// Legacy (pre-Keystore) identity seed: `SHA-256("hop.identity.v1|ANDROID_ID")`. Kept only as the
-        /// one-time migration seed so existing installs keep their address; never the primary source.
-        private fun legacyDeviceSeed(context: Context): ByteArray {
-            val androidId = android.provider.Settings.Secure.getString(
-                context.contentResolver, android.provider.Settings.Secure.ANDROID_ID
-            ) ?: "hop-fallback"
-            return java.security.MessageDigest.getInstance("SHA-256")
-                .digest("hop.identity.v1|$androidId".toByteArray())
-        }
-
-        /// Legacy (pre-Keystore) db key: `SHA-256("hop.db.key.v1|ANDROID_ID")`. Migration seed only.
-        private fun legacyDbKey(context: Context): ByteArray {
-            val androidId = android.provider.Settings.Secure.getString(
-                context.contentResolver, android.provider.Settings.Secure.ANDROID_ID
-            ) ?: "hop-fallback"
-            return java.security.MessageDigest.getInstance("SHA-256")
-                .digest("hop.db.key.v1|$androidId".toByteArray())
-        }
+            KeystoreSecret.deviceSecrets(context).database
 
         /// Compact elapsed-time label: 3s / 5m / 2h / 4d.
         fun compactDuration(ms: ULong): String {

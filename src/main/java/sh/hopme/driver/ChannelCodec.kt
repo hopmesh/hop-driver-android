@@ -22,6 +22,9 @@ internal object ChannelCodec {
                     put("path", m.path)
                     put("sender", android.util.Base64.encodeToString(m.sender, android.util.Base64.NO_WRAP))
                     put("text", m.text)
+                    m.inboxId?.let {
+                        put("inboxId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP))
+                    }
                 })
             }
             root.put(id, arr)
@@ -32,20 +35,45 @@ internal object ChannelCodec {
     /// Parse channels.json back into per-topic threads (insertion-ordered). [newLocalId] supplies a fresh
     /// local id per message in file order (the driver passes nextMsgId.getAndIncrement()). Malformed JSON
     /// yields an empty map (a missing/corrupt mirror is "no channels", never a crash).
-    fun decode(text: String, newLocalId: () -> Long): Map<String, List<HopBearer.HpsMsg>> {
-        val root = runCatching { JSONObject(text) }.getOrNull() ?: return emptyMap()
+    fun decode(text: String, newLocalId: () -> Long): Map<String, List<HopBearer.HpsMsg>> =
+        decodeBounded(text, newLocalId) ?: emptyMap()
+
+    fun decodeBounded(
+        text: String,
+        newLocalId: () -> Long,
+        maximumConversations: Int = RetentionPolicy.defaults.conversations,
+        maximumElements: Int = RetentionPolicy.defaults.globalMessages,
+        maximumAggregateBytes: Long = RetentionPolicy.defaults.globalMessageBytes,
+    ): Map<String, List<HopBearer.HpsMsg>>? = runCatching {
+        val root = JSONObject(text)
+        check(root.length() <= maximumConversations)
         val loaded = LinkedHashMap<String, List<HopBearer.HpsMsg>>()
+        var elements = 0
+        var aggregate = 0L
         for (id in root.keys()) {
+            aggregate += id.toByteArray(Charsets.UTF_8).size
+            check(aggregate <= maximumAggregateBytes)
             val arr = root.optJSONArray(id) ?: continue
+            check(arr.length() <= maximumElements - elements)
             val msgs = ArrayList<HopBearer.HpsMsg>()
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                msgs.add(HopBearer.HpsMsg(newLocalId(), o.optString("path", ""),
+                val inboxId = o.optString("inboxId", "").takeIf { it.isNotEmpty() }?.let {
+                    runCatching { android.util.Base64.decode(it, android.util.Base64.NO_WRAP) }.getOrNull()
+                }
+                val message = HopBearer.HpsMsg(newLocalId(), o.optString("path", ""),
                     android.util.Base64.decode(o.optString("sender", ""), android.util.Base64.NO_WRAP),
-                    o.optString("text", "")))
+                    o.optString("text", ""), inboxId)
+                val bytes = message.path.toByteArray(Charsets.UTF_8).size.toLong() +
+                    message.sender.size + message.text.toByteArray(Charsets.UTF_8).size +
+                    (message.inboxId?.size ?: 0)
+                check(bytes <= maximumAggregateBytes - aggregate)
+                aggregate += bytes
+                elements += 1
+                msgs.add(message)
             }
             loaded[id] = msgs
         }
-        return loaded
-    }
+        loaded
+    }.getOrNull()
 }

@@ -12,6 +12,12 @@ import org.json.JSONObject
  * previously lived inline in writeMessages/loadMessages.
  */
 internal object MessageCodec {
+    internal data class MediaRow(
+        val peer: String,
+        val inboxId: List<Byte>?,
+        val references: List<String>,
+    )
+
     /// Serialize a message snapshot to the messages.json array string. [imgRefs] maps a message's
     /// localId to its externalized image references ((single ref or null) to (multi refs)); the caller
     /// externalizes the blobs first, so this only writes the refs.
@@ -39,6 +45,7 @@ internal object MessageCodec {
             // Keep the bundleId: the node re-sprays undelivered own-bundles after restart (node.rs
             // rehydrate); persisting it lets refresh() re-query messageStatus and flip to Delivered.
             m.bundleId?.let { o.put("bundleId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
+            m.inboxId?.let { o.put("inboxId", android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP)) }
             arr.put(o)
         }
         return arr.toString()
@@ -53,9 +60,21 @@ internal object MessageCodec {
         text: String,
         newLocalId: () -> Long,
         getMedia: (String) -> ByteArray?,
-    ): List<HopBearer.Message> {
-        val arr = runCatching { JSONArray(text) }.getOrNull() ?: return emptyList()
+    ): List<HopBearer.Message> = decodeBounded(text, newLocalId, getMedia) ?: emptyList()
+
+    /** Null means malformed or over limit, so the caller can quarantine rather than silently prune. */
+    fun decodeBounded(
+        text: String,
+        newLocalId: () -> Long,
+        getMedia: (String) -> ByteArray?,
+        maximumElements: Int = RetentionPolicy.defaults.globalMessages +
+            RetentionPolicy.defaults.pendingGlobalMessages,
+        maximumAggregateBytes: Long = RetentionPolicy.defaults.messageMirrorBytes,
+    ): List<HopBearer.Message>? = runCatching {
+        val arr = JSONArray(text)
+        check(arr.length() <= maximumElements)
         val loaded = ArrayList<HopBearer.Message>(arr.length())
+        var aggregate = 0L
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             val incoming = o.getBoolean("incoming")
@@ -68,12 +87,14 @@ internal object MessageCodec {
                 else -> null
             }
             val imgs: List<ByteArray> = o.optJSONArray("imageRefs")?.let { a ->
+                check(a.length() <= 32)
                 (0 until a.length()).mapNotNull { getMedia(a.getString(it)) }
             } ?: o.optJSONArray("images")?.let { a ->
+                check(a.length() <= 32)
                 (0 until a.length()).map { android.util.Base64.decode(a.getString(it), android.util.Base64.NO_WRAP) }
             } ?: emptyList()
             val trace = o.optJSONArray("trace")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
-            loaded.add(HopBearer.Message(
+            val message = HopBearer.Message(
                 localId = newLocalId(), peer = o.getString("peer"), text = o.optString("text", ""),
                 incoming = incoming, contentType = o.optString("contentType", "text/plain"),
                 imageData = single,
@@ -89,8 +110,51 @@ internal object MessageCodec {
                 // refresh() reconciles to Delivered when it lands, rather than falsely showing "not sent".
                 failed = o.optBoolean("failed", false),
                 bundleId = if (o.has("bundleId")) android.util.Base64.decode(o.getString("bundleId"), android.util.Base64.NO_WRAP) else null,
-            ))
+                inboxId = if (o.has("inboxId")) android.util.Base64.decode(o.getString("inboxId"), android.util.Base64.NO_WRAP) else null,
+            )
+            val bytes = RetentionPolicy.messageBytes(message)
+            check(single == null || single.size.toLong() <= RetentionPolicy.defaults.attachmentBytes)
+            check(imgs.all { it.size.toLong() <= RetentionPolicy.defaults.attachmentBytes })
+            check(bytes <= maximumAggregateBytes - aggregate)
+            aggregate += bytes
+            loaded.add(message)
         }
-        return loaded
-    }
+        loaded
+    }.getOrNull()
+
+    /** Parse only durable media ownership, without opening or allocating attachment bodies. */
+    fun mediaRows(
+        text: String,
+        maximumElements: Int = RetentionPolicy.defaults.globalMessages +
+            RetentionPolicy.defaults.pendingGlobalMessages,
+        maximumAggregateBytes: Long = RetentionPolicy.defaults.messageMirrorBytes,
+    ): List<MediaRow>? = runCatching {
+        val array = JSONArray(text)
+        check(array.length() <= maximumElements)
+        val rows = ArrayList<MediaRow>(array.length())
+        var aggregate = 0L
+        for (index in 0 until array.length()) {
+            val value = array.getJSONObject(index)
+            val peer = value.getString("peer")
+            val references = ArrayList<String>()
+            if (value.has("imageRef")) references.add(value.getString("imageRef"))
+            value.optJSONArray("imageRefs")?.let { names ->
+                check(names.length() <= 32)
+                for (nameIndex in 0 until names.length()) references.add(names.getString(nameIndex))
+            }
+            aggregate = Math.addExact(aggregate, peer.toByteArray(Charsets.UTF_8).size.toLong())
+            for (reference in references) {
+                check(reference.length == 43 && reference.all {
+                    it.isLetterOrDigit() || it == '-' || it == '_'
+                })
+                aggregate = Math.addExact(aggregate, reference.toByteArray(Charsets.US_ASCII).size.toLong())
+            }
+            check(aggregate <= maximumAggregateBytes)
+            val inboxId = value.optString("inboxId", "").takeIf { it.isNotEmpty() }?.let {
+                android.util.Base64.decode(it, android.util.Base64.NO_WRAP).toList()
+            }
+            rows.add(MediaRow(peer, inboxId, references))
+        }
+        rows
+    }.getOrNull()
 }

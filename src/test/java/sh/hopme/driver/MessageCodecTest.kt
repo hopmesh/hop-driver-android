@@ -27,10 +27,10 @@ class MessageCodecTest {
         peer: String, text: String, incoming: Boolean,
         contentType: String = "text/plain",
         imageData: ByteArray? = null, images: List<ByteArray> = emptyList(),
-        bundleId: ByteArray? = null, hops: UByte = 0u, delivered: Boolean = false,
+        bundleId: ByteArray? = null, inboxId: ByteArray? = null, hops: UByte = 0u, delivered: Boolean = false,
         failed: Boolean = false, trace: List<String> = emptyList(),
     ) = HopBearer.Message(
-        localId = newId(), peer = peer, text = text, incoming = incoming, bundleId = bundleId,
+        localId = newId(), peer = peer, text = text, incoming = incoming, bundleId = bundleId, inboxId = inboxId,
         contentType = contentType, imageData = imageData, images = images, hops = hops,
         trace = trace, delivered = delivered, failed = failed,
     )
@@ -54,6 +54,13 @@ class MessageCodecTest {
         val back = MessageCodec.decode(json, ::newId, noMedia).single()
         assertArrayEquals(id, back.bundleId)
         assertFalse(back.incoming)
+    }
+
+    @Test fun incomingInboxIdSurvivesRoundTrip() {
+        val id = ByteArray(32) { (it + 9).toByte() }
+        val orig = msg("HpAddrPeerI", "received", incoming = true, inboxId = id)
+        val back = MessageCodec.decode(MessageCodec.encode(listOf(orig), emptyMap()), ::newId, noMedia).single()
+        assertArrayEquals(id, back.inboxId)
     }
 
     @Test fun imagesAreStoredByRefNotInlined() {
@@ -120,6 +127,20 @@ class MessageCodecTest {
         assertEquals("text/plain", back.contentType)
         assertEquals(0u.toUByte(), back.hops)
         assertNull(back.bundleId)
+        assertNull(back.inboxId)
         assertFalse(back.delivered)
+    }
+
+    @Test fun boundedDecodeRejectsElementCountAndAggregateBytes() {
+        val json = MessageCodec.encode(
+            listOf(msg("p", "one", true), msg("p", "two", true)), emptyMap(),
+        )
+        assertNull(MessageCodec.decodeBounded(json, ::newId, noMedia, maximumElements = 1))
+        assertNull(MessageCodec.decodeBounded(
+            json, ::newId, noMedia, maximumElements = 2, maximumAggregateBytes = 2,
+        ))
+        assertEquals(2, MessageCodec.decodeBounded(
+            json, ::newId, noMedia, maximumElements = 2, maximumAggregateBytes = 1_000,
+        )?.size)
     }
 }

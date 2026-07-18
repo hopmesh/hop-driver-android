@@ -31,6 +31,7 @@ abstract class DriverTestBase {
         context = ApplicationProvider.getApplicationContext()
         // A clean slate so persisted mirrors from a prior test don't bleed in.
         context.filesDir.listFiles()?.forEach { it.deleteRecursively() }
+        context.noBackupFilesDir.listFiles()?.forEach { it.deleteRecursively() }
         context.getSharedPreferences("hop", Context.MODE_PRIVATE).edit().clear().commit()
         fake = FakeHopNode()
         bearer = newBearer(fake)
@@ -51,8 +52,11 @@ abstract class DriverTestBase {
 
     /** Build a driver (the base one, or a "restart" reading the same mirrors) and register it so every
      *  bearer - hence every BleBearer status-executor thread - is torn down at the end of the test. */
-    protected fun newBearer(node: FakeHopNode, cfg: HopConfig = defaultConfig()): HopBearer =
-        HopBearer(context, cfg, node).also { extraBearers.add(it) }
+    internal fun newBearer(
+        node: FakeHopNode,
+        cfg: HopConfig = defaultConfig(),
+        limits: RetentionLimits = RetentionPolicy.defaults,
+    ): HopBearer = HopBearer(context, cfg, node, limits).also { extraBearers.add(it) }
 
     protected fun defaultConfig(dbKey: ByteArray = ByteArray(0)): HopConfig = HopConfig(
         dbPath = File(context.filesDir, "hop-test.db").absolutePath,
@@ -107,5 +111,5 @@ abstract class DriverTestBase {
         return false
     }
 
-    protected fun filesFile(name: String) = File(context.filesDir, name)
+    protected fun filesFile(name: String) = File(context.noBackupFilesDir, name)
 }

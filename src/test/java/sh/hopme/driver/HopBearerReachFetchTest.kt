@@ -79,4 +79,58 @@ class HopBearerReachFetchTest : DriverTestBase() {
         assertEquals("the record is empty on failure", 0, handed!!.second.size)
         runCatching { b.teardown() }; settleOn(b, 1)
     }
+
+    @Test fun redirectToAnotherOriginIsNotFollowedOrCached() {
+        val other = MockWebServer().apply { start() }
+        try {
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest) = MockResponse()
+                    .setResponseCode(302)
+                    .setHeader("Location", other.url("/.well-known/hop"))
+            }
+            val fake2 = FakeHopNode()
+            val b = newBearer(fake2, defaultConfig().copy(hnsResolverBase = server.url("").toString()))
+            fake2.pendingDnsLookups.add("bound.example")
+            b.send("kick", HopBearer.Peer(ByteArray(32) { 1 }, "x", 0u))
+            awaitReach(fake2, b, "bound.example")
+
+            assertEquals("redirect target must never be contacted", 0, other.requestCount)
+            assertEquals(0, fake2.reachRecords.single { it.first == "bound.example" }.second.size)
+        } finally {
+            other.shutdown()
+        }
+    }
+
+    @Test fun wrongStatusContentTypeAndOversizedBodyAreRejected() {
+        val responses = ArrayDeque<MockResponse>().apply {
+            add(MockResponse().setResponseCode(201).setHeader("Content-Type", "application/json").setBody(wellKnownJson))
+            add(MockResponse().setResponseCode(200).setHeader("Content-Type", "text/plain").setBody(wellKnownJson))
+            add(MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                .setBody("x".repeat(64 * 1024 + 1)))
+        }
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest) = responses.removeFirst()
+        }
+        val fake2 = FakeHopNode()
+        val b = newBearer(fake2, defaultConfig().copy(hnsResolverBase = server.url("").toString()))
+        for (domain in listOf("status.example", "type.example", "large.example")) {
+            fake2.pendingDnsLookups.add(domain)
+            b.send("kick", HopBearer.Peer(ByteArray(32) { 1 }, "x", 0u))
+            awaitReach(fake2, b, domain)
+            assertEquals(0, fake2.reachRecords.single { it.first == domain }.second.size)
+        }
+    }
+
+    @Test fun resolverAuthorityWithCredentialsIsRejectedBeforeNetwork() {
+        val fake2 = FakeHopNode()
+        val base = server.url("")
+        val credentialed = "${base.scheme}://user:pass@${base.host}:${base.port}"
+        val b = newBearer(fake2, defaultConfig().copy(hnsResolverBase = credentialed))
+        fake2.pendingDnsLookups.add("credentials.example")
+        b.send("kick", HopBearer.Peer(ByteArray(32) { 1 }, "x", 0u))
+        awaitReach(fake2, b, "credentials.example")
+
+        assertEquals(0, server.requestCount)
+        assertEquals(0, fake2.reachRecords.single().second.size)
+    }
 }

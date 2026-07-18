@@ -32,9 +32,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * decodeIdentity / serviceIdentify) run against the REAL host libhop (JNA, jna.library.path), so
  * addresses/base58 behave for real; only the stateful node surface is faked here.
  *
- * Every `take*`/`drain*` accessor is drain-on-read (returns the queued items once, then clears), exactly
- * like the real node, so a single pump() consumes each item once. Tests push items into the `pending*`
- * lists and read back what the driver did via the `sent*` records.
+ * Draining accessors clear their queued items. `takeInbox` models the core's durable inbox and only
+ * removes an item after `acceptInbox`. Tests push items into the `pending*` lists and read back what the
+ * driver did via the `sent*` records.
  */
 class FakeHopNode(
     private val addr: ByteArray = ByteArray(32) { (it + 1).toByte() },
@@ -75,6 +75,8 @@ class FakeHopNode(
     var resolve: (String) -> HnsLookupResult = { HnsLookupResult.Pending }
     /** when true, sendMessage throws (drives the stampSent "failed" path). */
     var sendMessageThrows = false
+    var failHttpResponseAcceptance = false
+    var failServiceResponseAcceptance = false
 
     // ---- what the driver did (assertions read these) --------------------------
     data class Sent(val dst: ByteArray, val contentType: String, val body: ByteArray, val ack: Boolean)
@@ -91,6 +93,10 @@ class FakeHopNode(
     val connectedLinks = mutableListOf<ULong>()
     val disconnectedLinks = mutableListOf<ULong>()
     val received = mutableListOf<Pair<ULong, ByteArray>>()
+    val acceptedInboxIds = mutableListOf<ByteArray>()
+    val acceptedHpsIds = mutableListOf<ByteArray>()
+    val acceptedHttpResponseIds = mutableListOf<ByteArray>()
+    val acceptedServiceResponseIds = mutableListOf<ByteArray>()
     var prekeysPublished = 0
     var ticks = 0
     var cleared = 0
@@ -141,7 +147,12 @@ class FakeHopNode(
     override fun messageStatus(id: ByteArray): MessageStatus =
         statuses[id.toList()] ?: MessageStatus(relayed = 0u, delivered = false, deliveryHops = 0u, deliveryMs = 0u)
 
-    override fun takeInbox(): List<InboxMessage> = drain(pendingInbox)
+    override fun takeInbox(): List<InboxMessage> = pendingInbox.toList()
+    override fun acceptInbox(id: ByteArray): Boolean {
+        val removed = pendingInbox.removeAll { it.id.contentEquals(id) }
+        if (removed) acceptedInboxIds.add(id.copyOf())
+        return removed
+    }
     override fun browse(service: String, tag: String): List<ServiceHit> = browseHits
     override fun browseDiscoverable(): List<HpsTopicInfo> = discoverable
     override fun peerLinks(): List<PeerLink> = peerLinksList
@@ -159,7 +170,13 @@ class FakeHopNode(
     override fun sendServiceResponse(to: ByteArray, forRequestId: ByteArray, status: UShort, body: ByteArray): ByteArray {
         serviceResponses.add(status.toInt()); return nextId()
     }
-    override fun takeServiceResponses(): List<ServiceResp> = drain(pendingServiceResponses)
+    override fun takeServiceResponses(): List<ServiceResp> = pendingServiceResponses.toList()
+    override fun acceptServiceResponse(id: ByteArray): Boolean {
+        if (failServiceResponseAcceptance) return false
+        val removed = pendingServiceResponses.removeAll { it.id.contentEquals(id) }
+        if (removed) acceptedServiceResponseIds.add(id.copyOf())
+        return removed
+    }
     override fun takeServiceRequests(): List<ServiceReq> = drain(pendingServiceRequests)
 
     // hps:// (§32)
@@ -179,7 +196,12 @@ class FakeHopNode(
     override fun hpsReach(path: String): UInt = reach
     override fun hpsRekey(path: String, newPath: String, remove: List<ByteArray>): List<ByteArray> = listOf(nextId())
     override fun hpsMyTopics(): List<HpsMyTopic> = myTopics
-    override fun takeHpsMessages(): List<HpsMessage> = drain(pendingHpsMessages)
+    override fun takeHpsMessages(): List<HpsMessage> = pendingHpsMessages.toList()
+    override fun acceptHpsMessage(id: ByteArray): Boolean {
+        val removed = pendingHpsMessages.removeAll { it.id.contentEquals(id) }
+        if (removed) acceptedHpsIds.add(id.copyOf())
+        return removed
+    }
     override fun takeHpsInvites(): List<HpsInvite> = drain(pendingHpsInvites)
 
     // HNS + hops:// (§30)
@@ -189,7 +211,13 @@ class FakeHopNode(
     }
     override fun sendHttpResponse(to: ByteArray, forRequestId: ByteArray, status: UShort, body: ByteArray) {}
     override fun takeHnsResults(): List<HnsRecord> = drain(pendingHnsResults)
-    override fun takeHttpResponses(): List<HttpResp> = drain(pendingHttpResponses)
+    override fun takeHttpResponses(): List<HttpResp> = pendingHttpResponses.toList()
+    override fun acceptHttpResponse(id: ByteArray): Boolean {
+        if (failHttpResponseAcceptance) return false
+        val removed = pendingHttpResponses.removeAll { it.id.contentEquals(id) }
+        if (removed) acceptedHttpResponseIds.add(id.copyOf())
+        return removed
+    }
     override fun takeHttpRequests(): List<HttpReq> = drain(pendingHttpRequests)
     override fun takeDnsLookups(): List<String> = drain(pendingDnsLookups)
     override fun provideReachRecord(domain: String, record: ByteArray) { reachRecords.add(domain to record) }

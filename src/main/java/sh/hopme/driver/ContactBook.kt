@@ -37,22 +37,33 @@ internal object ContactBook {
     /// list (the driver treats a missing/corrupt file as "no contacts", never a crash). Entries with a
     /// blank address are dropped. A missing "name" falls back to the address (the driver uses shortHex,
     /// but at this layer the base58 address is the honest fallback key).
-    fun decode(text: String): List<ContactRecord> {
-        val arr = runCatching { JSONArray(text) }.getOrNull() ?: return emptyList()
+    fun decode(text: String): List<ContactRecord> = decodeBounded(text) ?: emptyList()
+
+    fun decodeBounded(
+        text: String,
+        maximumElements: Int = RetentionPolicy.defaults.contacts,
+        maximumAggregateBytes: Long = RetentionPolicy.defaults.contactMirrorBytes,
+    ): List<ContactRecord>? = runCatching {
+        val arr = JSONArray(text)
+        check(arr.length() <= maximumElements)
         val out = ArrayList<ContactRecord>(arr.length())
+        var aggregate = 0L
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             val addr = o.optString("addr", "")
             if (addr.isEmpty()) continue
-            out.add(
-                ContactRecord(
+            val record = ContactRecord(
                     addr58 = addr,
                     name = o.optString("name", addr),
                     platform = o.optString("platform", ""),
                     app = o.optString("app", ""),
-                ),
-            )
+                )
+            val bytes = (record.addr58 + record.name + record.platform + record.app)
+                .toByteArray(Charsets.UTF_8).size.toLong()
+            check(bytes <= maximumAggregateBytes - aggregate)
+            aggregate += bytes
+            out.add(record)
         }
-        return out
-    }
+        out
+    }.getOrNull()
 }

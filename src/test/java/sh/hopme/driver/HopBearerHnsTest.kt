@@ -1,6 +1,7 @@
 package sh.hopme.driver
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.hop.HnsLookupResult
@@ -38,6 +39,17 @@ class HopBearerHnsTest : DriverTestBase() {
         assertTrue(bearer.hopsResults["?"]!!.contains("not a hops"))
     }
 
+    @Test fun openHopsCanonicalizesCaseAndRejectsAmbiguousAuthorities() {
+        fake.resolve = { HnsLookupResult.Cached(endpoint) }
+        bearer.openHops("HOPS://Alice.Hop/a?q=1"); settle()
+        assertTrue(fake.hopsRequests.contains("alice.hop"))
+
+        for (url in listOf("https://alice.hop", "hops://user@alice.hop/", "hops://alice.hop:443/", "hops://alice.hop\\@evil/")) {
+            bearer.openHops(url); settle()
+        }
+        assertTrue(bearer.hopsResults["?"]!!.contains("not a hops"))
+    }
+
     @Test fun openHopsPendingThenResolvedFires() {
         fake.resolve = { HnsLookupResult.Pending }
         bearer.openHops("late.hop/p"); settle()
@@ -52,10 +64,11 @@ class HopBearerHnsTest : DriverTestBase() {
         bearer.openHops("dave.hop"); settle()
         val reqId = fake.lastHopsReqId
         fake.pendingHttpResponses.add(
-            HttpResp(from = endpoint, forRequestId = reqId, status = 200u, contentType = "text/plain", body = "OK".toByteArray()),
+            HttpResp(id = ByteArray(32) { 1 }, from = endpoint, forRequestId = reqId, status = 200u, contentType = "text/plain", body = "OK".toByteArray()),
         )
         pump()
         assertTrue(bearer.hopsResults["dave.hop"]!!.contains("200"))
+        assertTrue(fake.acceptedHttpResponseIds.any { it.contentEquals(ByteArray(32) { 1 }) })
     }
 
     // ---- WebView (callback) path ----
@@ -67,14 +80,41 @@ class HopBearerHnsTest : DriverTestBase() {
     @Test fun hopsFetchCachedThenResponse() {
         fake.resolve = { HnsLookupResult.Cached(endpoint) }
         val cb = Cb()
-        bearer.hopsFetch("hops://web.hop/page", cb.fn); settle()
+        var acceptedBeforeCallback = false
+        bearer.hopsFetch("hops://web.hop/page") { status, contentType, body ->
+            acceptedBeforeCallback = fake.acceptedHttpResponseIds.isNotEmpty()
+            cb.fn(status, contentType, body)
+        }
+        settle()
         assertTrue(fake.hopsRequests.contains("web.hop"))
         fake.pendingHttpResponses.add(
-            HttpResp(from = endpoint, forRequestId = fake.lastHopsReqId, status = 201u, contentType = "text/html", body = "<h1>".toByteArray()),
+            HttpResp(id = ByteArray(32) { 2 }, from = endpoint, forRequestId = fake.lastHopsReqId, status = 201u, contentType = "text/html", body = "<h1>".toByteArray()),
         )
         pump()
         assertEquals(201, cb.status)
         assertEquals("text/html", cb.ct)
+        assertFalse("the core row must remain durable until callback delivery", acceptedBeforeCallback)
+        assertTrue(fake.acceptedHttpResponseIds.any { it.contentEquals(ByteArray(32) { 2 }) })
+    }
+
+    @Test fun failedHttpAcceptanceRetriesWithoutRepeatingTheCallback() {
+        fake.resolve = { HnsLookupResult.Cached(endpoint) }
+        val cb = Cb()
+        bearer.hopsFetch("hops://retry.hop/page", cb.fn); settle()
+        val id = ByteArray(32) { 3 }
+        fake.failHttpResponseAcceptance = true
+        fake.pendingHttpResponses.add(
+            HttpResp(id = id, from = endpoint, forRequestId = fake.lastHopsReqId, status = 200u,
+                contentType = "text/plain", body = "once".toByteArray()),
+        )
+        pump()
+        assertEquals(1, cb.calls)
+        assertTrue(fake.acceptedHttpResponseIds.isEmpty())
+
+        fake.failHttpResponseAcceptance = false
+        pump()
+        assertEquals(1, cb.calls)
+        assertTrue(fake.acceptedHttpResponseIds.any { it.contentEquals(id) })
     }
 
     @Test fun hopsFetchBadUrlAndOfflineAndNegative() {

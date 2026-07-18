@@ -28,8 +28,8 @@ data class HopConfig(
     /** Optional base-URL override for the HNS reach-record fetch (§30). Empty = production: resolve a
      *  name by fetching `https://<domain>/.well-known/hop`, where the domain's own TLS cert proves the
      *  domain and the served reach record self-certifies the address. Set it (e.g. to a MockWebServer,
-     *  or a shared resolver) to fetch `<base>/.well-known/hop` instead, so the unit suite exercises the
-     *  fetch path without real network / a real cert. */
+     *  loopback server) to fetch `<base>/.well-known/hop` instead, so the unit suite exercises the
+     *  fetch path without real network / a real cert. Non-loopback overrides are rejected. */
     val hnsResolverBase: String = "",
 ) {
     companion object {

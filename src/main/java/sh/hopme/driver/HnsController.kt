@@ -6,9 +6,12 @@ import androidx.compose.runtime.mutableStateMapOf
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import uniffi.hop.HnsLookupResult
 import uniffi.hop.HopNodeInterface
-import java.util.concurrent.ConcurrentHashMap
+import java.io.ByteArrayOutputStream
+import java.net.URI
 
 /**
  * HNS + hops:// concern (DESIGN.md §30), split out of the [HopBearer] god-object into a cohesive
@@ -30,7 +33,7 @@ internal class HnsController(
     private val core: Handler,
     private val onUi: (() -> Unit) -> Unit,
     private val pump: () -> Unit,
-    private val nameByAddr: ConcurrentHashMap<List<Byte>, String>,
+    private val rememberName: (List<Byte>, String) -> Unit,
     private val hnsResolverBase: String,
     hnsMaxConcurrent: Int,
 ) {
@@ -38,16 +41,21 @@ internal class HnsController(
     val hopsResults = mutableStateMapOf<String, String>()
     private val pendingHops = HashMap<String, String>()              // domain → path awaiting resolve
     private val hopsReqs = HashMap<List<Byte>, String>()             // request id → domain
+    private val dispatchedHttpResponses = HashSet<List<Byte>>()
+    private val deliveredHttpResponses = HashMap<List<Byte>, ByteArray>()
     // HTTP client for well-known reach-record fetches (§30). BOUNDED concurrency: a burst of resolves
     // (a page that references many hops:// domains, or a flood of takeDnsLookups) could otherwise spawn
     // an unbounded number of in-flight HTTPS GETs and exhaust sockets/threads. Cap the dispatcher so
     // excess calls queue instead of all firing at once. maxRequestsPerHost stays at the OkHttp default
     // (5) since each domain is its own host now (the GET goes to the domain being resolved).
     private val httpClient = OkHttpClient.Builder()
+        .followRedirects(false)
+        .followSslRedirects(false)
         .dispatcher(okhttp3.Dispatcher().apply {
             maxRequests = hnsMaxConcurrent              // total in-flight GETs across all domains
         })
         .build()
+    private val resolverOrigin = hnsResolverBase.takeIf { it.isNotBlank() }?.let(::canonicalResolverOrigin)
     // HNS cache debug view: domain → (address, ttl).
     val hnsCache = mutableStateListOf<HopBearer.HnsCacheRow>()
 
@@ -68,7 +76,7 @@ internal class HnsController(
     }
 
     private fun fireHops(domain: String, path: String, endpoint: ByteArray) {
-        nameByAddr[endpoint.toList()] = domain // label the endpoint by its domain (endpoints list/traces)
+        rememberName(endpoint.toList(), domain) // label the endpoint by its domain (endpoints list/traces)
         val id = runCatching {
             node.sendHopsRequest(endpoint, domain, "GET", path, ByteArray(0), 8u * 1024u * 1024u)
         }.getOrNull()
@@ -123,7 +131,7 @@ internal class HnsController(
     }
 
     private fun fireHopsWeb(domain: String, path: String, endpoint: ByteArray, cb: (Int, String, ByteArray) -> Unit) {
-        nameByAddr[endpoint.toList()] = domain
+        rememberName(endpoint.toList(), domain)
         val id = runCatching {
             node.sendHopsRequest(endpoint, domain, "GET", path, ByteArray(0), 8u * 1024u * 1024u)
         }.getOrNull()
@@ -133,6 +141,12 @@ internal class HnsController(
     }
 
     fun drainHns() {
+        for ((key, id) in deliveredHttpResponses.toMap()) {
+            if (runCatching { node.acceptHttpResponse(id) }.getOrDefault(false)) {
+                deliveredHttpResponses.remove(key)
+                dispatchedHttpResponses.remove(key)
+            }
+        }
         for (rec in node.takeHnsResults()) {
             // WebView fetches queued on this domain's resolution take priority.
             hopsWebPending.remove(rec.domain)?.let { queued ->
@@ -146,11 +160,40 @@ internal class HnsController(
             else fireHops(rec.domain, path, rec.address)
         }
         for (resp in node.takeHttpResponses()) {
+            val responseKey = resp.id.toList()
+            if (responseKey in dispatchedHttpResponses) continue
             val webCb = hopsWebReqs.remove(resp.forRequestId.toList())?.first
-            if (webCb != null) { webCb(resp.status.toInt(), resp.contentType, resp.body); continue }
-            val domain = hopsReqs.remove(resp.forRequestId.toList()) ?: continue
-            val line = "${resp.status} · ${String(resp.body)}"
-            onUi { hopsResults[domain] = line }
+            if (webCb != null) {
+                dispatchedHttpResponses.add(responseKey)
+                onUi {
+                    webCb(resp.status.toInt(), resp.contentType, resp.body)
+                    core.post {
+                        deliveredHttpResponses[responseKey] = resp.id
+                        if (runCatching { node.acceptHttpResponse(resp.id) }.getOrDefault(false)) {
+                            deliveredHttpResponses.remove(responseKey)
+                            dispatchedHttpResponses.remove(responseKey)
+                        }
+                    }
+                }
+                continue
+            }
+            val domain = hopsReqs.remove(resp.forRequestId.toList())
+            if (domain != null) {
+                val line = "${resp.status} · ${String(resp.body)}"
+                dispatchedHttpResponses.add(responseKey)
+                onUi {
+                    hopsResults[domain] = line
+                    core.post {
+                        deliveredHttpResponses[responseKey] = resp.id
+                        if (runCatching { node.acceptHttpResponse(resp.id) }.getOrDefault(false)) {
+                            deliveredHttpResponses.remove(responseKey)
+                            dispatchedHttpResponses.remove(responseKey)
+                        }
+                    }
+                }
+            } else {
+                runCatching { node.acceptHttpResponse(resp.id) }
+            }
         }
         // Host resolver hook (§30): fetch each requested domain's `/.well-known/hop` reach record over
         // HTTPS and hand core the raw record bytes; core verifies the self-certifying signature and
@@ -169,14 +212,27 @@ internal class HnsController(
     /// record, which it negative-caches. In production the base is `https://<domain>`; a non-empty
     /// [hnsResolverBase] override (tests, or a shared resolver) replaces just the scheme+host.
     private fun fetchReachRecord(domain: String) {
-        val base = if (hnsResolverBase.isNotEmpty()) hnsResolverBase.trimEnd('/') else "https://$domain"
-        val req = Request.Builder().url("$base/.well-known/hop").build()
+        val url = reachRecordUrl(domain)
+        if (url == null) {
+            core.post { runCatching { node.provideReachRecord(domain, ByteArray(0)) }; pump() }
+            return
+        }
+        val req = Request.Builder().url(url).get().build()
         httpClient.newCall(req).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) { deliver(ByteArray(0)) }
             override fun onResponse(call: okhttp3.Call, response: Response) {
                 val record = response.use {
-                    if (!it.isSuccessful) ByteArray(0)
-                    else runCatching { parseReachRecord(it.body?.string().orEmpty()) }.getOrDefault(ByteArray(0))
+                    val body = it.body
+                    val contentType = body.contentType()
+                    if (it.code != 200 || it.request.url != url ||
+                        it.headers.byteCount() > HNS_MAX_HEADER_BYTES ||
+                        contentType?.let { type -> type.type == "application" && type.subtype == "json" } != true ||
+                        body.contentLength() > HNS_MAX_BODY_BYTES) {
+                        ByteArray(0)
+                    } else {
+                        runCatching { readCapped(body.byteStream(), HNS_MAX_BODY_BYTES)?.let(::parseReachRecord) }
+                            .getOrNull() ?: ByteArray(0)
+                    }
                 }
                 deliver(record)
             }
@@ -189,20 +245,70 @@ internal class HnsController(
 
     /// Pull the `reach` field out of a `/.well-known/hop` JSON body and base64-decode it to the raw
     /// reach-record bytes. Returns empty if the field is absent or not valid base64.
-    private fun parseReachRecord(body: String): ByteArray {
-        val reachB64 = org.json.JSONObject(body).optString("reach", "")
+    private fun parseReachRecord(body: ByteArray): ByteArray {
+        val reachB64 = org.json.JSONObject(String(body, Charsets.UTF_8)).optString("reach", "")
         if (reachB64.isEmpty()) return ByteArray(0)
-        return runCatching { java.util.Base64.getDecoder().decode(reachB64) }.getOrDefault(ByteArray(0))
+        return runCatching { java.util.Base64.getDecoder().decode(reachB64) }
+            .getOrNull()?.takeIf { it.size <= HNS_MAX_RECORD_BYTES } ?: ByteArray(0)
+    }
+
+    private fun reachRecordUrl(domain: String): HttpUrl? {
+        val host = canonicalDomain(domain) ?: return null
+        val origin = if (hnsResolverBase.isBlank()) {
+            HttpUrl.Builder().scheme("https").host(host).build()
+        } else {
+            resolverOrigin ?: return null
+        }
+        return origin.newBuilder().encodedPath("/.well-known/hop").query(null).fragment(null).build()
+    }
+
+    private fun canonicalResolverOrigin(raw: String): HttpUrl? {
+        val parsed = raw.toHttpUrlOrNull() ?: return null
+        if (parsed.scheme !in setOf("http", "https") || parsed.username.isNotEmpty() ||
+            parsed.password.isNotEmpty() || parsed.query != null || parsed.fragment != null ||
+            parsed.encodedPath != "/") return null
+        if (parsed.host !in setOf("localhost", "127.0.0.1", "::1")) return null
+        return parsed.newBuilder().encodedPath("/").build()
+    }
+
+    private fun readCapped(input: java.io.InputStream, maximum: Long): ByteArray? {
+        val out = ByteArrayOutputStream(minOf(maximum, 8_192).toInt())
+        val buffer = ByteArray(8_192)
+        var total = 0L
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            if (total > maximum) return null
+            out.write(buffer, 0, count)
+        }
+        return out.toByteArray()
     }
 
     /// Parse a hops:// URL (or bare domain) into (domain, path). The endpoint validates host,
     /// so we pass the bare domain and just the path.
     private fun parseHops(input: String): Pair<String, String> {
-        var s = input.trim().removePrefix("hops://").removePrefix("https://").removePrefix("http://")
-        val slash = s.indexOf('/')
-        val domain = (if (slash >= 0) s.substring(0, slash) else s).lowercase()
-        val path = if (slash >= 0) s.substring(slash) else "/"
+        val raw = input.trim()
+        if (raw.isEmpty() || raw.contains('\\')) return "" to "/"
+        val absolute = if (raw.contains("://")) raw else "hops://$raw"
+        val uri = runCatching { URI(absolute) }.getOrNull() ?: return "" to "/"
+        if (!uri.scheme.equals("hops", ignoreCase = true) || uri.isOpaque || uri.userInfo != null ||
+            uri.port != -1 || uri.fragment != null) return "" to "/"
+        val domain = canonicalDomain(uri.host ?: return "" to "/") ?: return "" to "/"
+        val path = (uri.rawPath?.ifEmpty { "/" } ?: "/") +
+            (uri.rawQuery?.let { "?$it" } ?: "")
         return domain to path
+    }
+
+    private fun canonicalDomain(raw: String): String? {
+        val host = raw.lowercase()
+        if (host.length !in 1..253 || host.endsWith('.') || host.any { it.code !in 0x21..0x7e }) return null
+        val labels = host.split('.')
+        if (labels.any { label ->
+                label.length !in 1..63 || label.first() == '-' || label.last() == '-' ||
+                    label.any { !it.isLetterOrDigit() && it != '-' }
+            }) return null
+        return host
     }
 
     /// Release the HTTP client's dispatcher thread pool + connection pool (bounded, but still held).
@@ -210,5 +316,11 @@ internal class HnsController(
     fun shutdown() {
         runCatching { httpClient.dispatcher.executorService.shutdown() }
         runCatching { httpClient.connectionPool.evictAll() }
+    }
+
+    private companion object {
+        const val HNS_MAX_HEADER_BYTES = 32L * 1024L
+        const val HNS_MAX_BODY_BYTES = 64L * 1024L
+        const val HNS_MAX_RECORD_BYTES = 32 * 1024
     }
 }

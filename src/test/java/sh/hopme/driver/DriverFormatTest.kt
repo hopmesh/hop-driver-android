@@ -4,6 +4,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
 
 /**
  * quality-cov: the driver's pure display + wire helpers (HopBearer companion). [compactDuration] and
@@ -52,9 +53,39 @@ class DriverFormatTest {
         }
     }
 
+    private fun decodeSuccess(data: ByteArray): List<Pair<String, ByteArray>> {
+        val result = HopBearer.decodeMultipart(data)
+        assertTrue("expected success, got $result", result is MultipartDecodeResult.Success)
+        return (result as MultipartDecodeResult.Success).parts
+    }
+
+    private fun assertDecodeFailure(data: ByteArray, reason: MultipartDecodeFailure) {
+        assertEquals(MultipartDecodeResult.Failure(reason), HopBearer.decodeMultipart(data))
+    }
+
+    private fun writeU32(out: ByteArrayOutputStream, value: Long) {
+        out.write((value ushr 24).toInt())
+        out.write((value ushr 16).toInt())
+        out.write((value ushr 8).toInt())
+        out.write(value.toInt())
+    }
+
+    private fun writePart(out: ByteArrayOutputStream, bodyLength: Long, body: ByteArray = ByteArray(0)) {
+        out.write(0)
+        out.write(1)
+        out.write('x'.code)
+        writeU32(out, bodyLength)
+        out.write(body)
+    }
+
+    private fun declaredBodyLength(length: Long): ByteArray = ByteArrayOutputStream().also { out ->
+        writeU32(out, 1)
+        writePart(out, length)
+    }.toByteArray()
+
     @Test fun multipartRoundTripsASinglePart() {
         val parts = listOf("text/plain" to "hello mesh".toByteArray())
-        assertPartsEqual(parts, HopBearer.decodeMultipart(HopBearer.encodeMultipart(parts)))
+        assertPartsEqual(parts, decodeSuccess(HopBearer.encodeMultipart(parts)))
     }
 
     @Test fun multipartRoundTripsTextPlusBinaryImages() {
@@ -63,36 +94,99 @@ class DriverFormatTest {
             "image/png" to byteArrayOf(0, 1, 2, 0x7f, -1, -128),
             "image/jpeg" to ByteArray(300) { (it % 256).toByte() },
         )
-        assertPartsEqual(parts, HopBearer.decodeMultipart(HopBearer.encodeMultipart(parts)))
+        assertPartsEqual(parts, decodeSuccess(HopBearer.encodeMultipart(parts)))
     }
 
     @Test fun multipartRoundTripsEmptyList() {
         val encoded = HopBearer.encodeMultipart(emptyList())
-        assertTrue(HopBearer.decodeMultipart(encoded).isEmpty())
+        assertTrue(decodeSuccess(encoded).isEmpty())
     }
 
     @Test fun multipartRoundTripsAnEmptyBody() {
         val parts = listOf("application/octet-stream" to ByteArray(0))
-        assertPartsEqual(parts, HopBearer.decodeMultipart(HopBearer.encodeMultipart(parts)))
+        assertPartsEqual(parts, decodeSuccess(HopBearer.encodeMultipart(parts)))
     }
 
-    @Test fun decodeOfTruncatedDataFailsSafeToWhatItParsed() {
-        // A body shorter than its declared count must not throw or over-read; it returns the parts it
-        // could fully read (defensive decode). Encode 2 parts, then cut the buffer mid-second-part.
-        val parts = listOf("a" to byteArrayOf(1, 2, 3), "b" to byteArrayOf(9, 9, 9, 9))
-        val full = HopBearer.encodeMultipart(parts)
-        val truncated = full.copyOfRange(0, full.size - 2)
-        val decoded = HopBearer.decodeMultipart(truncated)
-        // The first part is intact; the second is dropped rather than corrupting or crashing.
-        assertTrue(decoded.size <= parts.size)
-        if (decoded.isNotEmpty()) {
-            assertEquals("a", decoded[0].first)
-            assertArrayEquals(byteArrayOf(1, 2, 3), decoded[0].second)
+    @Test fun unsignedHighBitAndMaxCountsAreRejectedBeforeIteration() {
+        for (count in listOf(0x8000_0000L, 0xffff_ffffL)) {
+            val out = ByteArrayOutputStream()
+            writeU32(out, count)
+            assertDecodeFailure(out.toByteArray(), MultipartDecodeFailure.TOO_MANY_PARTS)
         }
     }
 
-    @Test fun decodeOfEmptyBufferIsEmpty() {
-        assertTrue(HopBearer.decodeMultipart(ByteArray(0)).isEmpty())
+    @Test fun unsignedHighBitAndMaxPartLengthsAreRejectedBeforeSlicing() {
+        for (length in listOf(0x8000_0000L, 0xffff_ffffL)) {
+            assertDecodeFailure(declaredBodyLength(length), MultipartDecodeFailure.PART_TOO_LARGE)
+        }
+    }
+
+    @Test fun everyTruncationPointReturnsTypedFailure() {
+        val full = HopBearer.encodeMultipart(listOf("x" to byteArrayOf(1, 2, 3)))
+        for (length in listOf(0, 4, 5, 6, full.size - 1)) {
+            assertDecodeFailure(full.copyOf(length), MultipartDecodeFailure.TRUNCATED)
+        }
+    }
+
+    @Test fun overflowCombinationAfterAValidPartFailsWithoutIntConversion() {
+        val out = ByteArrayOutputStream()
+        writeU32(out, 2)
+        writePart(out, 1, byteArrayOf(7))
+        writePart(out, 0xffff_ffffL)
+        assertDecodeFailure(out.toByteArray(), MultipartDecodeFailure.PART_TOO_LARGE)
+    }
+
+    @Test fun eachCapPlusOneIsRejected() {
+        val count = ByteArrayOutputStream().also { writeU32(it, HopBearer.MULTIPART_MAX_PARTS.toLong() + 1) }
+        assertDecodeFailure(count.toByteArray(), MultipartDecodeFailure.TOO_MANY_PARTS)
+        assertDecodeFailure(
+            declaredBodyLength(HopBearer.MULTIPART_MAX_PART_BYTES.toLong() + 1),
+            MultipartDecodeFailure.PART_TOO_LARGE,
+        )
+        val contentType = ByteArrayOutputStream()
+        writeU32(contentType, 1)
+        val contentTypeLength = HopBearer.MULTIPART_MAX_CONTENT_TYPE_BYTES + 1
+        contentType.write(contentTypeLength ushr 8)
+        contentType.write(contentTypeLength)
+        assertDecodeFailure(contentType.toByteArray(), MultipartDecodeFailure.CONTENT_TYPE_TOO_LARGE)
+
+        val aggregate = ByteArrayOutputStream()
+        writeU32(aggregate, 2)
+        val first = ByteArray(HopBearer.MULTIPART_MAX_PART_BYTES)
+        writePart(aggregate, first.size.toLong(), first)
+        val secondLength = HopBearer.MULTIPART_MAX_AGGREGATE_BYTES.toLong() - first.size - 2 + 1
+        writePart(aggregate, secondLength)
+        assertDecodeFailure(aggregate.toByteArray(), MultipartDecodeFailure.AGGREGATE_TOO_LARGE)
+    }
+
+    @Test fun exactCountPartAndAggregateCapsAreAccepted() {
+        val exactCount = List(HopBearer.MULTIPART_MAX_PARTS) { "x" to ByteArray(0) }
+        assertEquals(HopBearer.MULTIPART_MAX_PARTS, decodeSuccess(HopBearer.encodeMultipart(exactCount)).size)
+
+        val exactContentType = "x".repeat(HopBearer.MULTIPART_MAX_CONTENT_TYPE_BYTES)
+        assertEquals(
+            exactContentType,
+            decodeSuccess(HopBearer.encodeMultipart(listOf(exactContentType to ByteArray(0)))).single().first,
+        )
+
+        val exactPart = ByteArray(HopBearer.MULTIPART_MAX_PART_BYTES)
+        assertEquals(
+            exactPart.size,
+            decodeSuccess(HopBearer.encodeMultipart(listOf("x" to exactPart))).single().second.size,
+        )
+
+        val secondSize = HopBearer.MULTIPART_MAX_AGGREGATE_BYTES - exactPart.size - 2
+        val exactAggregate = listOf("x" to exactPart, "y" to ByteArray(secondSize))
+        val decoded = decodeSuccess(HopBearer.encodeMultipart(exactAggregate))
+        assertEquals(
+            HopBearer.MULTIPART_MAX_AGGREGATE_BYTES,
+            decoded.sumOf { it.first.toByteArray(Charsets.UTF_8).size + it.second.size },
+        )
+    }
+
+    @Test fun trailingBytesAreMalformedRatherThanPartiallyAccepted() {
+        val valid = HopBearer.encodeMultipart(listOf("x" to byteArrayOf(1)))
+        assertDecodeFailure(valid + byteArrayOf(0), MultipartDecodeFailure.TRAILING_BYTES)
     }
 
     // ---- companion constants the UI + relay path depend on ------------------------------

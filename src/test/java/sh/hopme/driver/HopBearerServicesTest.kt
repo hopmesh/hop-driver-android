@@ -19,20 +19,39 @@ class HopBearerServicesTest : DriverTestBase() {
     @Test fun binaryServiceResponseIsByteCounted() {
         // unknown request id + non-UTF8 body → "service <- status: <N bytes>"
         fake.pendingServiceResponses.add(
-            ServiceResp(from = ByteArray(32) { 2 }, forRequestId = ByteArray(16) { 8 },
+            ServiceResp(id = ByteArray(32) { 1 }, from = ByteArray(32) { 2 }, forRequestId = ByteArray(16) { 8 },
                 status = 200u, body = byteArrayOf(0xff.toByte(), 0xfe.toByte(), 0x00)),
         )
         pump()
         assertTrue(bearer.serviceLog.any { it.contains("bytes>") })
+        assertTrue(fake.acceptedServiceResponseIds.any { it.contentEquals(ByteArray(32) { 1 }) })
     }
 
     @Test fun utf8ServiceResponseShowsText() {
         fake.pendingServiceResponses.add(
-            ServiceResp(from = ByteArray(32) { 2 }, forRequestId = ByteArray(16) { 8 },
+            ServiceResp(id = ByteArray(32) { 2 }, from = ByteArray(32) { 2 }, forRequestId = ByteArray(16) { 8 },
                 status = 200u, body = "hello-svc".toByteArray()),
         )
         pump()
         assertTrue(bearer.serviceLog.any { it.contains("hello-svc") })
+        assertTrue(fake.acceptedServiceResponseIds.any { it.contentEquals(ByteArray(32) { 2 }) })
+    }
+
+    @Test fun failedAcceptanceRetriesWithoutDuplicateDispatch() {
+        val id = ByteArray(32) { 4 }
+        fake.failServiceResponseAcceptance = true
+        fake.pendingServiceResponses.add(
+            ServiceResp(id = id, from = ByteArray(32) { 2 }, forRequestId = ByteArray(32) { 8 },
+                status = 200u, body = "retry-svc".toByteArray()),
+        )
+        pump()
+        assertEquals(1, bearer.serviceLog.count { it.contains("retry-svc") })
+        assertTrue(fake.acceptedServiceResponseIds.isEmpty())
+
+        fake.failServiceResponseAcceptance = false
+        pump()
+        assertEquals(1, bearer.serviceLog.count { it.contains("retry-svc") })
+        assertTrue(fake.acceptedServiceResponseIds.any { it.contentEquals(id) })
     }
 
     @Test fun customServiceRequestGets501() {
@@ -48,7 +67,7 @@ class HopBearerServicesTest : DriverTestBase() {
     @Test fun newSenderTriggersIdentify() {
         bearer.appInForeground = true
         fake.pendingInbox.add(
-            InboxMessage(from = ByteArray(32) { 7 }, contentType = "text/plain",
+            InboxMessage(id = ByteArray(32) { 1 }, from = ByteArray(32) { 7 }, contentType = "text/plain",
                 body = "hi".toByteArray(), hops = 1u, createdAt = 1uL, trace = emptyList()),
         )
         pump()
@@ -60,7 +79,7 @@ class HopBearerServicesTest : DriverTestBase() {
         // fire an identify (via an inbound message), then feed a response keyed to that request id.
         bearer.appInForeground = true
         fake.pendingInbox.add(
-            InboxMessage(from = ByteArray(32) { 7 }, contentType = "text/plain",
+            InboxMessage(id = ByteArray(32) { 2 }, from = ByteArray(32) { 7 }, contentType = "text/plain",
                 body = "hi".toByteArray(), hops = 1u, createdAt = 1uL, trace = emptyList()),
         )
         pump()
@@ -69,7 +88,7 @@ class HopBearerServicesTest : DriverTestBase() {
         // body isn't a real identity encoding, so decodeIdentity returns null -> the lenient text branch,
         // but the identify request id IS recognized + removed (the matched-id path).
         fake.pendingServiceResponses.add(
-            ServiceResp(from = ByteArray(32) { 7 }, forRequestId = reqId, status = 0u, body = "x".toByteArray()),
+            ServiceResp(id = ByteArray(32) { 3 }, from = ByteArray(32) { 7 }, forRequestId = reqId, status = 0u, body = "x".toByteArray()),
         )
         pump()
         assertEquals(0, bearer.serviceLog.count { it.startsWith("identify ← ") })

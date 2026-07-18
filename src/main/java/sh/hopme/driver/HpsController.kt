@@ -9,7 +9,6 @@ import uniffi.hop.HpsInvite
 import uniffi.hop.HpsKind
 import uniffi.hop.HpsTopicInfo
 import uniffi.hop.addressFromBase58
-import java.io.File
 
 /**
  * hps:// pub/sub concern (DESIGN.md §32), split out of the [HopBearer] god-object into a cohesive
@@ -31,13 +30,15 @@ internal class HpsController(
     private val pump: () -> Unit,
     private val newLocalId: () -> Long,
     private val mirror: MirrorStore,
-    private val filesDir: File,
 ) {
     val hpsTopics = mutableStateListOf<HopBearer.HpsTopic>()
     val hpsThreads = mutableStateMapOf<String, SnapshotStateList<HopBearer.HpsMsg>>() // topic id → messages
     val hpsUnread = mutableStateMapOf<String, Int>()                                  // topic id → unread
     val hpsInvites = mutableStateListOf<HpsInvite>()                                  // invites received
     @Volatile var activeTopic: String? = null                                        // topic on screen
+    private val durableInboxIds = BoundedLruSet<List<Byte>>(
+        RetentionPolicy.defaults.globalMessages + RetentionPolicy.defaults.journalRecords,
+    )
 
     // Defaults for access/discoverable live on the HopBearer facade the app calls; this internal method
     // is always invoked with explicit args, so it takes none (no dead default-value synthesis here).
@@ -114,6 +115,8 @@ internal class HpsController(
     }
 
     fun hpsLeave(topic: HopBearer.HpsTopic) = core.post {
+        val retained = hpsThreads.filterKeys { it != topic.id }.mapValues { it.value.toList() }
+        if (!writeChannelsNow(retained)) return@post
         runCatching { node.hpsLeave(topic.path) }
         onUi {
             hpsTopics.removeAll { it.id == topic.id }
@@ -127,15 +130,31 @@ internal class HpsController(
 
     private fun appendThread(id: String, m: HopBearer.HpsMsg) {
         onUi {
-            val list = hpsThreads.getOrPut(id) { mutableStateListOf() }
-            list.add(m)
-            if (list.size > 500) list.removeAt(0)
+            appendThreadNow(id, m)
         }
         saveChannels()
     }
+    private fun appendThreadNow(id: String, m: HopBearer.HpsMsg): Boolean {
+        if (id !in hpsThreads && hpsThreads.size >= RetentionPolicy.defaults.conversations) return false
+        val list = hpsThreads.getOrPut(id) { mutableStateListOf() }
+        list.add(m)
+        while (list.size > RetentionPolicy.defaults.conversationMessages ||
+            list.sumOf { it.text.toByteArray().size.toLong() } > RetentionPolicy.defaults.conversationMessageBytes) {
+            list.removeAt(0)
+        }
+        while (hpsThreads.values.sumOf { it.size } > RetentionPolicy.defaults.globalMessages ||
+            hpsThreads.values.sumOf { rows -> rows.sumOf { it.text.toByteArray().size.toLong() } } >
+                RetentionPolicy.defaults.globalMessageBytes) {
+            val oldest = hpsThreads.entries.flatMap { (key, rows) -> rows.map { key to it } }
+                .minWithOrNull(compareBy<Pair<String, HopBearer.HpsMsg>> { it.second.id }.thenBy { it.first })
+                ?: break
+            hpsThreads[oldest.first]?.removeAll { it.id == oldest.second.id }
+        }
+        return hpsThreads[id]?.any { it.id == m.id } == true
+    }
 
     // ---- channel-thread persistence (survives restart) ----------------------
-    private val channelsFile get() = File(filesDir, "channels.json")
+    private val channelsFile get() = mirror.file("channels.json")
     private var channelSaveScheduled = false
     private fun saveChannels() {
         if (channelSaveScheduled) return
@@ -146,20 +165,92 @@ internal class HpsController(
         // ChannelCodec owns the channels.json schema; the seal + write stay here (empty key ⇒ plain,
         // matching an unencrypted db). android-r2-01: the sealed mirror is not plaintext beside hop.db.
         val json = ChannelCodec.encode(hpsThreads)
-        runCatching { channelsFile.writeBytes(mirror.seal(json.toByteArray())) }
+        val durableIds = hpsThreads.values.flatten().mapNotNull { it.inboxId?.toList() }
+        mirror.enqueue("channels") {
+            check(mirror.write(channelsFile, json.toByteArray())) { "failed to persist channel mirror" }
+            check(mirror.resetDelta("channels")) { "failed to compact channel journal" }
+            durableInboxIds.replaceAll(durableIds)
+        }
+    }
+    private fun writeChannelsNow(snapshot: Map<String, List<HopBearer.HpsMsg>>): Boolean {
+        val json = ChannelCodec.encode(snapshot)
+        val persisted = runCatching {
+            mirror.writeNow("channels") {
+                mirror.write(channelsFile, json.toByteArray()) && mirror.resetDelta("channels")
+            }
+        }.getOrDefault(false)
+        if (persisted) {
+            durableInboxIds.replaceAll(snapshot.values.flatten().mapNotNull { it.inboxId?.toList() })
+        }
+        return persisted
     }
     fun loadChannels() {
-        val txt = mirror.read(channelsFile) ?: return
-        val loaded = ChannelCodec.decode(txt) { newLocalId() }
-        onUi { for ((id, msgs) in loaded) hpsThreads[id] = mutableStateListOf<HopBearer.HpsMsg>().apply { addAll(msgs) } }
+        val txt = mirror.read(channelsFile)
+        val loaded: LinkedHashMap<String, MutableList<HopBearer.HpsMsg>> = if (txt == null) {
+            linkedMapOf()
+        } else {
+            ChannelCodec.decodeBounded(txt, newLocalId = { newLocalId() })
+                ?.mapValuesTo(linkedMapOf()) { it.value.toMutableList() }
+                ?: run {
+                    mirror.quarantine(channelsFile)
+                    linkedMapOf()
+                }
+        }
+        durableInboxIds.replaceAll(loaded.values.flatten().mapNotNull { it.inboxId?.toList() })
+        val replay = mirror.replayDeltas("channels")
+        for (record in replay.records) {
+            val stableId = record.id.toList()
+            durableInboxIds.add(stableId)
+            val payload = record.payload ?: continue
+            val delta = ChannelCodec.decodeBounded(
+                String(payload, Charsets.UTF_8), newLocalId = { newLocalId() }, maximumConversations = 1,
+                maximumElements = 1,
+            ) ?: continue
+            val (id, rows) = delta.entries.singleOrNull() ?: continue
+            val row = rows.singleOrNull() ?: continue
+            if (loaded.values.none { existing -> existing.any { it.inboxId?.contentEquals(record.id) == true } }) {
+                loaded.getOrPut(id) { mutableListOf() }.add(row)
+            }
+        }
+        if (txt == null && replay.records.isEmpty()) return
+        writeChannelsNow(loaded)
+        onUi {
+            for ((id, msgs) in loaded) {
+                for (message in msgs) appendThreadNow(id, message)
+            }
+        }
     }
 
     fun drainHps() {
-        for (m in node.takeHpsMessages()) {
+        val incoming = node.takeHpsMessages()
+        for (m in incoming) {
+            val stableId = m.id.toList()
+            if (stableId in durableInboxIds) {
+                runCatching { node.acceptHpsMessage(m.id) }
+                continue
+            }
             val topic = hpsTopics.firstOrNull { it.path == m.path }
             val id = topic?.id ?: m.path
-            appendThread(id, HopBearer.HpsMsg(newLocalId(), m.path, m.sender, String(m.body)))
-            onUi { if (id != activeTopic) hpsUnread[id] = (hpsUnread[id] ?: 0) + 1 }
+            val text = String(m.body, Charsets.UTF_8)
+            val keep = text.toByteArray(Charsets.UTF_8).size.toLong() <=
+                RetentionPolicy.defaults.conversationMessageBytes &&
+                (id in hpsThreads || hpsThreads.size < RetentionPolicy.defaults.conversations)
+            val row = HopBearer.HpsMsg(newLocalId(), m.path, m.sender, text, m.id)
+            val payload = if (keep) ChannelCodec.encode(mapOf(id to listOf(row))).toByteArray() else null
+            val appended = runCatching {
+                mirror.writeNow("channels") { mirror.appendDelta("channels", m.id, payload) }
+            }.getOrDefault(false)
+            if (!appended) continue
+            durableInboxIds.add(stableId)
+            runCatching { node.acceptHpsMessage(m.id) }
+            if (keep) onUi {
+                if (appendThreadNow(id, row) && id != activeTopic) {
+                    hpsUnread[id] = (hpsUnread[id] ?: 0) + 1
+                }
+                core.post { saveChannels() }
+            } else {
+                core.post { saveChannels() }
+            }
         }
         for (inv in node.takeHpsInvites()) {
             onUi {

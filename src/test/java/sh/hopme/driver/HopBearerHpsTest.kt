@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.robolectric.Shadows.shadowOf
 import uniffi.hop.HpsAccess
 import uniffi.hop.HpsInvite
 import uniffi.hop.HpsKind
@@ -50,12 +51,57 @@ class HopBearerHpsTest : DriverTestBase() {
         bearer.hpsRegister("room", channel = true)
         settle()
         val topic = bearer.hpsTopics.first()
-        fake.pendingHpsMessages.add(HpsMessage(path = "room", sender = ByteArray(32) { 2 }, body = "yo".toByteArray()))
+        fake.pendingHpsMessages.add(HpsMessage(id = ByteArray(32) { 9 }, path = "room", sender = ByteArray(32) { 2 }, body = "yo".toByteArray()))
         // drainHps runs inside pump()
         bearer.hpsPublish(topic, "seed"); settle()
         val thread = bearer.hpsThreads[topic.id]!!
         assertTrue(thread.any { it.text == "yo" })
         assertTrue((bearer.hpsUnread[topic.id] ?: 0) >= 1)
+    }
+
+    @Test fun incomingHpsMessageJournalsBeforeCoreAcceptanceAndMainProjection() {
+        bearer.hpsRegister("room", channel = true)
+        settle()
+        val topic = bearer.hpsTopics.first()
+        val inboxId = ByteArray(32) { 7 }
+        fake.pendingHpsMessages.add(
+            HpsMessage(id = inboxId, path = "room", sender = ByteArray(32) { 2 }, body = "durable".toByteArray()),
+        )
+
+        bearer.hpsPublish(topic, "seed")
+        shadowOf(bearer.coreLooper).idle()
+        assertTrue(fake.acceptedHpsIds.single().contentEquals(inboxId))
+        assertTrue(filesFile("channels.delta").length() > "durable".length)
+
+        idleMain()
+        settle()
+        assertTrue(awaitFileContains(filesFile("channels.json"), "durable"))
+    }
+
+    @Test fun hpsJournalAppendFailureLeavesCoreItemForRetry() {
+        bearer.hpsRegister("room", channel = true)
+        settle()
+        val topic = bearer.hpsTopics.first()
+        val inboxId = ByteArray(32) { 0x71 }
+        val journal = filesFile("channels.delta")
+        journal.delete()
+        assertTrue(journal.mkdir())
+        fake.pendingHpsMessages.add(
+            HpsMessage(id = inboxId, path = "room", sender = ByteArray(32) { 2 }, body = "retry".toByteArray()),
+        )
+
+        // Drive pump without scheduling a channel snapshot that races the obstructed journal path.
+        bearer.hpsInvite(topic, ByteArray(32) { 3 })
+        settle()
+        assertTrue(fake.acceptedHpsIds.isEmpty())
+        assertTrue(fake.pendingHpsMessages.isNotEmpty())
+        assertFalse(bearer.hpsThreads[topic.id].orEmpty().any { it.inboxId?.contentEquals(inboxId) == true })
+
+        assertFalse(journal.exists())
+        bearer.hpsInvite(topic, ByteArray(32) { 3 })
+        settle()
+        assertTrue(fake.acceptedHpsIds.single().contentEquals(inboxId))
+        assertEquals(1, bearer.hpsThreads[topic.id].orEmpty().count { it.inboxId?.contentEquals(inboxId) == true })
     }
 
     @Test fun openTopicClearsUnread() {
