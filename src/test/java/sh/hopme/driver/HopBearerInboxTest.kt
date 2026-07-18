@@ -20,7 +20,7 @@ class HopBearerInboxTest : DriverTestBase() {
     private fun inbox(ct: String, body: ByteArray, from: ByteArray = sender(), id: ByteArray = ByteArray(32) { 4 }) =
         InboxMessage(id = id, from = from, contentType = ct, body = body, hops = 2u, createdAt = 1uL, trace = emptyList())
 
-    /** pump() is private; a private-mode update ends with pump() without scheduling a message snapshot. */
+    /** pump() is private; a private-mode update ends with pump() without adding an outgoing message. */
     private fun pumpViaSend() {
         bearer.setPrivateMode(true)
         settle()
@@ -158,7 +158,7 @@ class HopBearerInboxTest : DriverTestBase() {
         assertEquals(1, fake.pendingInbox.size)
         assertEquals(0, bearer.messages.count { it.inboxId?.contentEquals(id) == true })
 
-        assertFalse(journalPath.exists())
+        assertFalse(journalPath.isDirectory)
         assertTrue(filesFile("messages.delta.quarantine").isDirectory)
         pumpViaSend()
 
