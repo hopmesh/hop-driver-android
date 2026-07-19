@@ -27,8 +27,8 @@ jacoco { toolVersion = "0.8.11" }
 
 android {
     namespace = "sh.hopme.driver"
-    // okhttp-android's AAR metadata (okhttp 5.4.0, below) requires compileSdk >= 36 from every consumer.
-    compileSdk = 36
+    // okhttp 5.4.0 requires compileSdk >= 36 and core-ktx 1.19.0 requires >= 37 from every consumer.
+    compileSdk = 37
 
     defaultConfig {
         minSdk = 29 // L2CAP CoC (createInsecureL2capChannel) requires API 29+
@@ -77,9 +77,9 @@ android {
 }
 // AGP 9's restructured internal source-set classes no longer implement the classic (deprecated)
 // com.android.build.gradle.api.AndroidLibrarySourceSet interface, so the old `sourceSets["main"].java.
-// srcDir(...)` / `.jniLibs.srcDir(...)` pattern throws a ClassCastException under AGP 9.2.1 (confirmed
+// srcDir(...)` / `.jniLibs.srcDir(...)` pattern throws a ClassCastException under AGP 9.x (confirmed
 // locally). The androidComponents Variant API is the AGP-version-portable replacement (works unchanged
-// under both this build's AGP 8.5.2 and apps/android/HopDemo's AGP 9.2.1) and applies to every variant, same
+// under both Gradle builds that compile this module) and applies to every variant, same
 // as the old "main" source set did.
 androidComponents {
     onVariants { variant ->
@@ -107,14 +107,10 @@ dependencies {
     // Cloud relay bearer: WebSocket (path B, wss:// → Cloud Run) + the okio ByteString it speaks.
     api("com.squareup.okhttp3:okhttp:5.4.0")
 
-    // HELD at 1.13.1 (Dependabot PR #21 wants 1.19.0): androidx.core:core-ktx 1.19.0's AAR metadata hard-
-    // requires AGP >= 9.1.0 and compileSdk >= 37 from every consumer (a real build failure, not a
-    // warning, confirmed locally). :hop-driver is compiled by TWO independent Gradle builds - this one
-    // (AGP 8.5.2, matching Kotlin Gradle Plugin 2.4.0's own documented max-supported AGP of 9.1.0) and
-    // apps/android/HopDemo's (AGP 9.2.1) - so bumping core-ktx here would require also bumping this build's
-    // whole AGP/Gradle toolchain, which no Dependabot PR requested and which is out of scope for this
-    // migration. See the PR description for the held-PR note.
-    implementation("androidx.core:core-ktx:1.13.1")
+    // core-ktx 1.19.0's AAR metadata hard-requires AGP >= 9.1.0 and compileSdk >= 37 from every
+    // consumer; both Gradle builds that compile :hop-driver (bearers/android and apps/android/HopDemo)
+    // are on AGP 9.3 / compileSdk 37 now, so the long-held bump is finally satisfied on both sides.
+    implementation("androidx.core:core-ktx:1.19.0")
 
     // Shared cross-platform transport layer (ble-lab modules, wired in settings.gradle.kts). The
     // driver forms BLE (pure-L2CAP) + LAN links through these via one BearerManager; the legacy
