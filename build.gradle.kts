@@ -126,7 +126,7 @@ dependencies {
     // quality-net-03: pure-logic unit tests. junit + the REAL org.json (shadows the android.jar stub so
     // ContactBook's JSON round-trip is exercised for real).
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.json:json:20260522")
+    testImplementation("org.json:json:20260719")
 
     // cov/android-driver: Robolectric shadows the Android framework (Context / SharedPreferences /
     // Handler+Looper / NotificationManager / Base64 / Log / File IO) so the ~1150-line HopBearer instance
