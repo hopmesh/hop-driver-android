@@ -25,6 +25,8 @@ git-cliff. Do not edit by hand.
 - stop mentioning DNSSEC (no longer part of the design) (179a278)
 
 ### Features
+- finish inbound (import), drop export_pr (41c095e)
+- auto-generate monorepo + per-library changelogs (git-cliff) (8c64c37)
 - self-certifying reachability records (core + ABI) for DNS-free endpoint discovery (#126) (7c31123)
 
 ### Other
