@@ -8,6 +8,8 @@ git-cliff. Do not edit by hand.
 - bump create-github-app-token to v3.2.0 across all mirrored components (efc9f6c)
 
 ### Chore
+- bump org.json:json in /bearers/android (f1b4e0a)
+- bump org.json:json in /apps/android/HopDemo (49b7d48)
 - bump org.json:json in /apps/android/HopDemo (#107) (2a893c5)
 - bump org.robolectric:robolectric in /apps/android/HopDemo (#110) (89cb246)
 - bump androidx.test:core in /bearers/android (#113) (df1e0e0)
@@ -21,6 +23,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (a355901)
 - branded, marketable READMEs for every sub-repo (9c2a477)
 - stop mentioning DNSSEC (no longer part of the design) (179a278)
 
@@ -30,6 +33,7 @@ git-cliff. Do not edit by hand.
 - self-certifying reachability records (core + ABI) for DNS-free endpoint discovery (#126) (7c31123)
 
 ### Other
+- wire the relay pool end to end, and stop the wire guard false-firing (35946e0)
 - CLA gate on contributions (preserve commercial relicensing of core) (5a9aa7d)
 - SECURITY.md per component + enable-security in the bootstrap script (a1492e9)
 - copyright holder is Hop Mesh, LLC (7d8c514)
