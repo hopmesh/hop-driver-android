@@ -343,8 +343,23 @@ class HopBearer internal constructor(
         relaysOnVal = relaysOn
         if (relaysOn) {
             val relay = prefs.getString("pinnedRelay", null) ?: config.relayUrl
-            if (relay.isNotEmpty())
-                bearerMgr.register(sh.hopme.bearers.relay.RelayBearer(relay))
+            if (relay.isNotEmpty()) {
+                // §19 relay pool. Seed the node's pool with the operator/user choice, then let the
+                // bearer resolve PER DIAL ATTEMPT and report each outcome. That turns a dead relay
+                // from "retried forever until restart" into automatic failover: the BearerManager
+                // has no live re-register, so the choice has to move inside the bearer.
+                //
+                // The pool grows itself too: every verified reach record the node resolves becomes a
+                // Discovered candidate, which can never demote this Configured one.
+                node.relayAdd(relay, true)
+                bearerMgr.register(
+                    sh.hopme.bearers.relay.RelayBearer(
+                        seedUrl = relay,
+                        resolveUrl = { node.relayNext().ifEmpty { null } },
+                        reportOutcome = { url, ok -> node.relayReport(url, ok) },
+                    )
+                )
+            }
         }
         bearerMgr.start()
         // android-10: the mesh is up, so drive status off "starting…" so the UI reflects the live state

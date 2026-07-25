@@ -222,4 +222,22 @@ class FakeHopNode(
     override fun takeDnsLookups(): List<String> = drain(pendingDnsLookups)
     override fun provideReachRecord(domain: String, record: ByteArray) { reachRecords.add(domain to record) }
     override fun signReachRecord(endpoint: String, ttlSecs: UInt): ByteArray = ByteArray(0)
+
+    // §19 relay pool. A real in-memory model rather than stubs, so a driver test can actually
+    // assert failover: the driver's job is to seed the pool, dial `relayNext()`, and report each
+    // outcome, and a stubbed pool would let all three be wrong without failing anything.
+    val relayPool = LinkedHashMap<String, Boolean>()   // url -> healthy
+    val relayReports = mutableListOf<Pair<String, Boolean>>()
+    override fun relayAdd(url: String, configured: Boolean): Boolean {
+        if (url.isEmpty()) return false
+        relayPool.putIfAbsent(url, true)
+        return true
+    }
+    override fun relayNext(): String = relayPool.entries.firstOrNull { it.value }?.key ?: ""
+    override fun relayReport(url: String, ok: Boolean) {
+        relayReports.add(url to ok)
+        if (relayPool.containsKey(url)) relayPool[url] = ok
+    }
+    override fun relayPoolSize(): UInt = relayPool.size.toUInt()
+    override fun relayPoolAvailable(): UInt = relayPool.count { it.value }.toUInt()
 }
