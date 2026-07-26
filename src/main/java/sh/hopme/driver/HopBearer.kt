@@ -55,6 +55,15 @@ class HopBearer internal constructor(
         val address: ByteArray, val name: String, val hops: UByte,
         val active: Boolean = true, val platform: String = "", val app: String = "",
     )
+    /** Per-transport status for a settings UI. EVERY registered bearer is listed, including one with
+     *  no links and one the host switched off, because the row you switch back on must not vanish. */
+    data class TransportStatus(
+        val tag: String,          // the BearerManager handle ("BT"/"LAN"/"Relay")
+        val name: String,         // display name
+        val enabled: Boolean,     // the host's setting
+        val links: Int,           // live links right now
+    ) { val active: Boolean get() = links > 0 }
+
     data class Message(
         val localId: Long, val peer: String, val text: String, val incoming: Boolean,
         val bundleId: ByteArray? = null,
@@ -64,6 +73,14 @@ class HopBearer internal constructor(
         val images: List<ByteArray> = emptyList(),                   // one+ images of a multipart message
         val hops: UByte = 0u, val latencyMs: ULong? = null,           // incoming metadata
         val trace: List<String> = emptyList(),                        // provenance hop labels (§27)
+        /** When the ORIGINATING device says it sent this, from the bundle's `created_at`. Distinct
+         *  from [sentAt], which for an INCOMING message is when we received it, not when it was sent.
+         *
+         *  Precision is deliberately limited: on the §39 private path (the default) the wire stamp is
+         *  bucketed to 60s and rounded DOWN, because at ms resolution it is a sender timing
+         *  fingerprint. Render to the minute; seconds would imply precision the path removes on
+         *  purpose. Null when the sender left it unset (created_at 0, which would render as 1970). */
+        val originAt: Long? = null,
         val sentAt: Long = System.currentTimeMillis(),               // outgoing tracking
         val deliveredAt: Long? = null, val relayed: UInt = 0u,
         val delivered: Boolean = false, val deliveryHops: UByte = 0u,
@@ -100,6 +117,8 @@ class HopBearer internal constructor(
     /// Directly-linked peer address → the transport carrying it ("BT" / "Relay"); mesh peers
     /// (reached multi-hop) have no entry. Mirrors iOS's link-type indicators.
     val linkTransports = mutableStateMapOf<List<Byte>, String>()
+    /** Registered transports and whether each is on, for the debug app's Transports section. */
+    val transports = mutableStateListOf<TransportStatus>()
     val messages = mutableStateListOf<Message>()
     /// Unread incoming messages received while backgrounded - mirrored onto the app icon
     /// badge (via the notification) and cleared when the app returns to the foreground.
@@ -224,6 +243,37 @@ class HopBearer internal constructor(
     // and surfaced through bearerSink into the node seam. The manager's global link-id space starts
     // HIGH (1_000_000). (The legacy in-driver BLE/LAN/relay transports and Wi-Fi Direct were removed.)
     private val bearerMgr = sh.hop.BearerManager(baseLinkId = 1_000_000L)
+
+    /** Fixed display order, so toggling never makes rows jump around. */
+    private val TRANSPORT_DISPLAY = listOf("BT" to "Bluetooth", "LAN" to "Local Net", "Relay" to "Relay")
+
+    /** Serial executor for transport enable/disable. Deliberately NOT the core thread: a bearer's
+     *  start/stop touches radios and can block, and the core thread owns all node state, so blocking
+     *  it would stall every other link, the relay and tick(). Same coupling R-02 removed by moving the
+     *  BLE socket write off this thread. */
+    private val bearerControl = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "hop.bearer.control").apply { isDaemon = true }
+    }
+
+    /** Turn one shared transport on or off at runtime ([tag] is a [TransportStatus.tag]). Returns false
+     *  if no bearer carries that tag, e.g. a relay bearer that was never registered because relays are
+     *  off. Switching one off tears its live links down, so the node stops routing over it at once
+     *  instead of holding a path that can no longer deliver. */
+    fun setTransportEnabled(tag: String, on: Boolean): Boolean {
+        if (bearerMgr.bearerStates()[tag] == null) return false
+        bearerControl.execute {
+            bearerMgr.setEnabled(tag, on)
+            val states = bearerMgr.bearerStates()
+            onUi {
+                for (i in transports.indices) {
+                    val t = transports[i]
+                    val nowOn = states[t.tag] ?: t.enabled
+                    if (t.enabled != nowOn) transports[i] = t.copy(enabled = nowOn, links = if (nowOn) t.links else 0)
+                }
+            }
+        }
+        return true
+    }
     // One transport id shared by the bearers (the BLE/LAN HELLO id + greater-id dedup tiebreaker);
     // distinct from the Hop node address - Noise is still negotiated over the bearer's DATA frames.
     private val bearerId = sh.hop.randomNodeId()
@@ -723,7 +773,11 @@ class HopBearer internal constructor(
             val msg = Message(localId = nextMsgId.getAndIncrement(), peer = peerKey, text = text,
                 incoming = true, inboxId = m.id, contentType = storedContentType,
                 imageData = if (isImage) m.body else null, images = images,
-                hops = m.hops, latencyMs = latency, trace = m.trace.map { traceLabel(it) })
+                hops = m.hops, latencyMs = latency, trace = m.trace.map { traceLabel(it) },
+                // created_at 0 means the sender never stamped it; surface null rather than 1970.
+                // The FFI type is ULong; Message.originAt is Long to match sentAt, which the UI
+                // compares it against.
+                originAt = if (m.createdAt > 0uL) m.createdAt.toLong() else null)
             // quality-net-06: log inbound receipt to logcat the instant it lands, keyed by text (the
             // harness marker). tk_verify reads this instead of the lagging files/messages.json export.
             // android-r2-05: this prints the sender's full address + cleartext body, so it is DEBUG only
@@ -1246,7 +1300,19 @@ class HopBearer internal constructor(
             }
         }
 
+        // Per-transport rows: bearerStates() is the authority on WHICH transports exist (so a
+        // switched-off one is still listed and can be switched back on); the live link counts come
+        // from the same global link ids linkTransports was built from.
+        val states = bearerMgr.bearerStates()
+        val linkCounts = bearerMgr.activeTransports()
+        val tsLocal = TRANSPORT_DISPLAY.mapNotNull { (tag, name) ->
+            states[tag]?.let { on -> TransportStatus(tag, name, on, linkCounts[tag] ?: 0) }
+        } + states.keys.sorted()
+            .filter { tag -> TRANSPORT_DISPLAY.none { it.first == tag } }
+            .map { tag -> TransportStatus(tag, tag, states[tag] == true, linkCounts[tag] ?: 0) }
+
         onUi {
+            transports.clear(); transports.addAll(tsLocal)
             linkTransports.clear(); linkTransports.putAll(ltLocal)
             peers.clear(); peers.addAll(list)
             seen.clear(); seen.addAll(off)
