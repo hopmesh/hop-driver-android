@@ -422,6 +422,7 @@ class HopBearer internal constructor(
                         seedUrl = relay,
                         resolveUrl = { node.relayNext().ifEmpty { null } },
                         reportOutcome = { url, ok -> node.relayReport(url, ok) },
+                        socksProxy = config.socksProxy,
                     )
                 )
             }

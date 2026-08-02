@@ -31,6 +31,11 @@ data class HopConfig(
      *  loopback server) to fetch `<base>/.well-known/hop` instead, so the unit suite exercises the
      *  fetch path without real network / a real cert. Non-loopback overrides are rejected. */
     val hnsResolverBase: String = "",
+    /** `host:port` of a SOCKS5 proxy every relay dial rides through, e.g. `127.0.0.1:9050` for a local
+     *  Tor listener (Orbot, or an Arti instance the app embeds). Blank dials direct. This is what makes
+     *  an `.onion` relay reachable; hop ships no Tor implementation. A value that does not parse makes
+     *  the relay bearer refuse to dial rather than fall back to the clearnet. See `docs/tor.md`. */
+    val socksProxy: String = "",
 ) {
     companion object {
         /// android-r2-02: the ONE persisted pref both init paths read for the relay flag, so a
