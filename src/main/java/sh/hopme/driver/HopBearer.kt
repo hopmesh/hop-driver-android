@@ -274,6 +274,21 @@ class HopBearer internal constructor(
         }
         return true
     }
+
+    /** Each shared transport's enabled flag, read straight from the [BearerManager] rather than from the
+     *  UI mirror in [transports]. Read-only; for tests and the debug automation hook.
+     *
+     *  This exists because PLAT-001's closure contract can only be checked ON HARDWARE: assert that
+     *  `bearerStates()["BT"] == false` AGREES with [activeTransportCounts] while a peer is dialing. The
+     *  UI mirror cannot answer that, because it is written from the control thread and so can lag the
+     *  manager it is mirroring. Note [setTransportEnabled] is ASYNCHRONOUS: read this AFTER the toggle
+     *  has applied, never in the same breath as the call, or the answer is a race. */
+    fun transportStates(): Map<String, Boolean> = bearerMgr.bearerStates()
+
+    /** Live link count per transport: the other half of the PLAT-001 assertion, since a transport
+     *  reported disabled must not still be carrying links. Read-only. */
+    fun activeTransportCounts(): Map<String, Int> = bearerMgr.activeTransports()
+
     // One transport id shared by the bearers (the BLE/LAN HELLO id + greater-id dedup tiebreaker);
     // distinct from the Hop node address - Noise is still negotiated over the bearer's DATA frames.
     private val bearerId = sh.hop.randomNodeId()
