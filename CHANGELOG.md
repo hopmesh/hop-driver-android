@@ -23,6 +23,7 @@ git-cliff. Do not edit by hand.
 - Kotlin 2.4/AGP 9.2.1/Compose BOM 2026.06/okhttp 5.4 toolchain migration (#90) (d4844bd)
 
 ### Documentation
+- regenerate from conventional commits (e6b97f2)
 - regenerate from conventional commits (2741000)
 - regenerate from conventional commits (b96e019)
 - regenerate from conventional commits (330c8c6)
@@ -54,6 +55,7 @@ git-cliff. Do not edit by hand.
 - thin HopDriver composing the SDK + all four bearers (mirror of Apple) (171b04a)
 
 ### Testing
+- make the per-transport toggle drivable from automation, so PLAT-001 can be proven on hardware (7c889a9)
 - tolerate inbox journal compaction (6a33d64)
 - Robolectric suite takes the driver from D (~16%) to A (94% line) (#65) (112ea0f)
 
