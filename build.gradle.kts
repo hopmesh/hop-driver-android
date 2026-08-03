@@ -118,6 +118,9 @@ dependencies {
     implementation(project(":hop-sdk"))
     implementation(project(":bearer-ble"))
     implementation(project(":bearer-lan"))
+    // Meshtastic/LoRa bearer - relays Hop traffic through a connected Meshtastic radio's LoRa mesh, so a
+    // node reaches peers far past BLE/Wi-Fi range (delay-tolerant, which suits Hop). Same node seam.
+    implementation(project(":bearer-meshtastic"))
     // Cloud relay (WebSocket) shared bearer - one outbound link to the backbone, same node seam. Carries
     // OkHttp transitively (already a direct dep above); consumed only in prod, never in the ble-lab P2P room.
     // (No Wi-Fi Direct bearer: its per-peer connect-approval dialog is incompatible with a passive mesh.)

@@ -401,6 +401,9 @@ class HopBearer internal constructor(
         bearerMgr.sink = bearerSink
         bearerMgr.register(sh.hopme.bearers.ble.BleBearer(context, bearerId))
         bearerMgr.register(sh.hopme.bearers.lan.LanBearer(context, bearerId))
+        // Meshtastic/LoRa: relay through a connected Meshtastic radio's mesh. Surfaces as "LoRa"; if no
+        // radio is paired it simply scans and forms no links, so it is safe to always register.
+        bearerMgr.register(sh.hopme.bearers.meshtastic.MeshtasticBearer(context, bearerId))
         // Cloud relay (WebSocket) as a shared bearer - ONE outbound link to the backbone, registered
         // only when relays are enabled and a URL exists. (P2P test mode sets relaysEnabled=false, so
         // this stays unregistered.)
